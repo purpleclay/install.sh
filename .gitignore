@@ -1,10 +1,19 @@
 # Ignore everything and selectively allow files
 *
 
+!.envrc
 !.gitignore
+!.github/renovate.json
+!.github/workflows/*.yml
+!.zed/settings.json
 !CODE_OF_CONDUCT.md
+!CODEOWNERS
+!flake.lock
+!flake.nix
+!install.sh
 !LICENSE
 !README.md
+!test/*.bats
 
 # Recurse through sub-directories applying the same patterns
 !*/
