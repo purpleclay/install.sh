@@ -13,7 +13,10 @@
 !install.sh
 !LICENSE
 !README.md
+!scripts/*.awk
 !test/*.bats
+!test/live/*.bats
+!test/stubs/*
 
 # Recurse through sub-directories applying the same patterns
 !*/

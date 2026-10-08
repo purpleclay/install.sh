@@ -1,0 +1,4 @@
+#!/bin/sh
+# Stub sysctl: answers sysctl.proc_translated, which is 1 when an x86_64
+# process runs under Rosetta on Apple silicon. Set STUB_ROSETTA=1 to fake it.
+echo "${STUB_ROSETTA:-0}"
