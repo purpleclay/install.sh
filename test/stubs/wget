@@ -1,0 +1,49 @@
+#!/bin/sh
+# Stub wget: answers --spider requests from the routes in STUB_ROUTES, one
+# "URL STATUS [LOCATION]" per line, following redirects and printing each
+# response's headers to stderr like wget -S. A URL with no route fails like a
+# network error. Each call is appended to STUB_LOG.
+#
+# Behaves like GNU wget by default. STUB_WGET=busybox behaves like busybox
+# wget, which has neither --tries nor --https-only. STUB_WGET=busybox-insecure
+# behaves like a busybox wget built with its own TLS, which doesn't verify
+# certificates and says so on every HTTPS request.
+flavour="${STUB_WGET:-gnu}"
+case " $* " in
+  *" --help "*)
+    if [ "$flavour" = gnu ]; then
+      echo "  -t,  --tries=NUMBER            set number of retries to NUMBER"
+      echo "       --https-only              only follow secure HTTPS links"
+    fi
+    exit 0
+    ;;
+  *" --https-only "* | *" -t "*)
+    if [ "$flavour" != gnu ]; then
+      echo "wget: unrecognized option" >&2
+      exit 1
+    fi
+    ;;
+esac
+
+echo "wget $*" >>"$STUB_LOG"
+for url; do :; done
+[ "$flavour" != busybox-insecure ] || echo "wget: note: TLS certificate validation not implemented" >&2
+
+while :; do
+  route=$(awk -v u="$url" '$1 == u { print $2, $3; exit }' "$STUB_ROUTES")
+  if [ -z "$route" ]; then
+    echo "wget: unable to resolve host address" >&2
+    exit 4
+  fi
+
+  # shellcheck disable=SC2086 # split the route into status and location
+  set -- $route
+  printf '  HTTP/1.1 %s\n' "$1" >&2
+  if [ -n "${2:-}" ]; then
+    printf '  Location: %s\n' "$2" >&2
+    url="$2"
+    continue
+  fi
+  [ "$1" = 200 ] || exit 8
+  exit 0
+done

@@ -48,9 +48,13 @@ jobs:
         run: nix develop .#ci -c shfmt -d -s -i 2 -ci install.sh
 
   test:
-    name: test
+    name: test (${{ matrix.shell }})
     runs-on: ubuntu-latest
     timeout-minutes: 5
+    strategy:
+      fail-fast: false
+      matrix:
+        shell: [dash, "bash --posix", "busybox sh"]
     permissions:
       contents: read
     steps:
@@ -75,4 +79,12 @@ jobs:
           github_access_token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: bats
+        env:
+          TEST_SHELL: ${{ matrix.shell }}
         run: nix develop .#ci -c bats test
+
+      # Checks github.com still behaves the way the stubs assume. It tests
+      # GitHub, not the shell, so it only needs to run once.
+      - name: bats_live
+        if: matrix.shell == 'dash'
+        run: nix develop .#ci -c bats test/live

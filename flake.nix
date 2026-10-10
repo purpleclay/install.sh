@@ -38,12 +38,12 @@
 
             shellcheck = {
               enable = true;
-              files = "^(install\\.sh|test/.*\\.bats)$";
+              files = "^(install\\.sh|test/.*\\.bats|test/stubs/.*)$";
             };
 
             shfmt = {
               enable = true;
-              files = "^(install\\.sh|test/.*\\.bats)$";
+              files = "^(install\\.sh|test/.*\\.bats|test/stubs/.*)$";
               args = ["-i" "2" "-ci"];
             };
 
@@ -62,6 +62,13 @@
           p.bats-assert
           p.bats-support
         ]);
+
+        # Only the busybox binary. The full package also links its applets
+        # (ls, awk, tar and so on), which would shadow the real tools on PATH.
+        busybox-sh = pkgs.runCommand "busybox-sh" {} ''
+          mkdir -p $out/bin
+          ln -s ${pkgs.busybox}/bin/busybox $out/bin/busybox
+        '';
       in
         with pkgs; {
           devShells.default = mkShell {
@@ -81,11 +88,15 @@
           };
 
           devShells.ci = mkShell {
-            buildInputs = [
-              bats
-              shfmt
-              shellcheck
-            ];
+            buildInputs =
+              [
+                bats
+                dash
+                shfmt
+                shellcheck
+              ]
+              # nixpkgs only builds busybox for Linux
+              ++ lib.optionals stdenv.hostPlatform.isLinux [busybox-sh];
           };
         }
     );

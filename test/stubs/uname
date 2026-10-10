@@ -1,0 +1,6 @@
+#!/bin/sh
+# Stub uname: reports STUB_OS and STUB_ARCH, defaulting to Linux on x86_64.
+case "$1" in
+  -s) echo "${STUB_OS:-Linux}" ;;
+  -m) echo "${STUB_ARCH:-x86_64}" ;;
+esac

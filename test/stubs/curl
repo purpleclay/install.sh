@@ -1,0 +1,34 @@
+#!/bin/sh
+# Stub curl: answers HEAD requests from the routes in STUB_ROUTES, one
+# "URL STATUS [LOCATION]" per line, without following redirects. A URL with
+# no route fails like a DNS error. Each call is appended to STUB_LOG.
+echo "curl $*" >>"$STUB_LOG"
+for url; do :; done
+
+route=$(awk -v u="$url" '$1 == u { print $2, $3; exit }' "$STUB_ROUTES")
+if [ -z "$route" ]; then
+  echo "curl: (6) Could not resolve host" >&2
+  exit 6
+fi
+
+# shellcheck disable=SC2086 # split the route into status and location
+set -- $route
+
+# A status of xN fails like curl exit code N, after printing the status in the
+# third field, if any, as a proxy would.
+case "$1" in
+  x*)
+    [ -z "${2:-}" ] || printf 'HTTP/1.1 %s\r\n\r\n' "$2"
+    case "${1#x}" in
+      28) echo "curl: (28) Connection timed out after 10002 milliseconds" >&2 ;;
+      56) echo "curl: (56) CONNECT tunnel failed, response ${2:-000}" >&2 ;;
+      60) echo "curl: (60) SSL certificate problem: unable to get local issuer certificate" >&2 ;;
+      *) echo "curl: (${1#x}) Failure" >&2 ;;
+    esac
+    exit "${1#x}"
+    ;;
+esac
+
+printf 'HTTP/2 %s\r\n' "$1"
+[ -z "${2:-}" ] || printf 'location: %s\r\n' "$2"
+printf '\r\n'
