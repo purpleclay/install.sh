@@ -82,6 +82,7 @@
                 shfmt
                 shellcheck
                 typos
+                wrangler
                 zizmor
               ]
               ++ pre-commit-check.enabledPackages;
@@ -94,6 +95,7 @@
                 dash
                 shfmt
                 shellcheck
+                wrangler
               ]
               # nixpkgs only builds busybox for Linux
               ++ lib.optionals stdenv.hostPlatform.isLinux [busybox-sh];

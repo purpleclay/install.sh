@@ -88,3 +88,51 @@ jobs:
       - name: bats_live
         if: matrix.shell == 'dash'
         run: nix develop .#ci -c bats test/live
+
+  deploy:
+    name: deploy
+    needs: [lint, test]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment: release
+    permissions:
+      contents: read
+    steps:
+      - name: harden_runner
+        uses: step-security/harden-runner@ccd8616d44fd3846e67624a50d5aad6d37bf2d25 # v2.22.1
+        with:
+          egress-policy: block
+          allowed-endpoints: >
+            api.cloudflare.com:443
+            api.github.com:443
+            cache.nixos.org:443
+            get.purpleclay.io:443
+            github.com:443
+            releases.nixos.org:443
+
+      - name: checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: install_nix
+        uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31.11.1
+        with:
+          github_access_token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: wrangler_deploy
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+          WRANGLER_SEND_METRICS: "false"
+        run: |
+          cp install.sh public/
+          nix develop .#ci -c wrangler deploy
+
+      - name: smoke
+        run: |
+          test "$(curl -s -o /dev/null -w '%{http_code} %{redirect_url}' https://get.purpleclay.io/)" \
+            = "302 https://get.purpleclay.io/install.sh"
+          curl -fsSI https://get.purpleclay.io/install.sh | grep -qi '^content-type: text/plain'
+          curl -fsSL https://get.purpleclay.io | cmp - install.sh
