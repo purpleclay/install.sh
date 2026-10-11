@@ -10,13 +10,16 @@
 !CODEOWNERS
 !flake.lock
 !flake.nix
-!install.sh
+!/install.sh
 !LICENSE
+!public/_headers
+!public/_redirects
 !README.md
 !scripts/*.awk
 !test/*.bats
 !test/live/*.bats
 !test/stubs/*
+!wrangler.toml
 
 # Recurse through sub-directories applying the same patterns
 !*/
