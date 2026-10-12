@@ -131,9 +131,27 @@ jobs:
           cp install.sh public/
           nix develop .#ci -c wrangler deploy
 
+      # Cloudflare can take a few seconds to serve a new deploy everywhere, so
+      # the checks are retried for about a minute before failing
       - name: smoke
         run: |
-          test "$(curl -s -o /dev/null -w '%{http_code} %{redirect_url}' https://get.purpleclay.io/)" \
-            = "302 https://get.purpleclay.io/install.sh"
-          curl -fsSI https://get.purpleclay.io/install.sh | grep -qi '^content-type: text/plain'
-          curl -fsSL https://get.purpleclay.io | cmp - install.sh
+          check() {
+            test "$(curl -s -o /dev/null -w '%{http_code} %{redirect_url}' https://get.purpleclay.io/)" \
+              = "302 https://get.purpleclay.io/install.sh" ||
+              { echo "/ doesn't redirect to /install.sh"; return 1; }
+            curl -fsSI https://get.purpleclay.io/install.sh | grep -qi '^content-type: text/plain' ||
+              { echo "/install.sh isn't served as text/plain"; return 1; }
+            curl -fsSL https://get.purpleclay.io | cmp -s - install.sh ||
+              { echo "The served script isn't this commit's install.sh"; return 1; }
+          }
+          for attempt in 1 2 3 4 5 6; do
+            if check; then
+              exit 0
+            fi
+            if [ "$attempt" -lt 6 ]; then
+              echo "Attempt $attempt failed, retrying in 10 seconds"
+              sleep 10
+            fi
+          done
+          echo "::error::get.purpleclay.io still doesn't serve this commit's install.sh"
+          exit 1

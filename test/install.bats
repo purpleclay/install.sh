@@ -14,7 +14,7 @@ setup() {
   # being tested
   unset NO_COLOR PURPLECLAY_DEBUG PURPLECLAY_VERSION COLORTERM LC_ALL LC_CTYPE \
     HTTPS_PROXY https_proxy ALL_PROXY all_proxy NO_PROXY no_proxy \
-    CURL_CA_BUNDLE SSL_CERT_FILE SSL_CERT_DIR
+    CURL_CA_BUNDLE SSL_CERT_FILE SSL_CERT_DIR PURPLECLAY_DIR
   export LANG=C TERM=xterm-256color
   bats_load_library bats-support
   bats_load_library bats-assert
@@ -23,12 +23,12 @@ setup() {
 
   BIN="$BATS_TEST_TMPDIR/bin"
   mkdir -p "$BIN"
-  for tool in awk cat grep mktemp rm sed tr; do
+  for tool in awk cat chmod grep id install ls mkdir mktemp mv rm sed tar tr; do
     ln -s "$(command -v "$tool")" "$BIN/$tool"
   done
   # Optional: detect_shell falls back to ps and readlink, and minimal systems
-  # lack ps. Checksums use the first SHA-256 tool found.
-  for tool in ps readlink sha256sum shasum openssl; do
+  # lack ps. Checksums use the first SHA-256 tool found. GNU tar needs gzip.
+  for tool in ps readlink sha256sum shasum openssl gzip; do
     ! tool_path=$(command -v "$tool") || ln -s "$tool_path" "$BIN/$tool"
   done
   for stub in "$BATS_TEST_DIRNAME"/stubs/*; do
@@ -42,7 +42,7 @@ setup() {
   INSTALLER="$BATS_TEST_TMPDIR/install"
   cat >"$INSTALLER" <<EOF
 #!/bin/sh
-export PATH="$BIN"
+export PATH="\${TEST_PATH:-$BIN}"
 exec $shell "$PWD/install.sh" "\$@"
 EOF
   chmod +x "$INSTALLER"
@@ -52,6 +52,8 @@ EOF
   # The temporary directory is checked to be empty after a run
   export TMPDIR="$BATS_TEST_TMPDIR/tmp"
   mkdir -p "$TMPDIR"
+  # Never the real /usr/local/bin
+  export PURPLECLAY_DIR="$BATS_TEST_TMPDIR/prefix/bin"
 
   route "$GITHUB/nsv/releases/latest" 302 "$GITHUB/nsv/releases/tag/v0.12.2"
   route "$GITHUB/nsv/releases/tag/v0.12.2" 200
@@ -80,11 +82,34 @@ release() {
   mkdir -p "$dir"
   : >"$dir/checksums.txt"
   for file; do
-    printf '%s\n' "$product $tag $file" >"$dir/$file"
+    case "$file" in
+      *.tar.gz) pack "$dir/$file" "$product" "${tag#v}" ;;
+      *) printf '%s\n' "$product $tag $file" >"$dir/$file" ;;
+    esac
     printf '%s  %s\n' "$(sha256 "$dir/$file")" "$file" >>"$dir/checksums.txt"
     asset "$product" "$tag" "$file"
   done
   asset "$product" "$tag" checksums.txt
+}
+
+# pack ARCHIVE PRODUCT VERSION: an archive holding a fake PRODUCT binary that
+# prints VERSION when run with --version. Settings change what's packed:
+#   BINARIES       paths of the binaries in the archive [default: PRODUCT]
+#   REPORTS        the version the binaries print [default: VERSION]
+#   VERSION_FLAG   the one flag they answer to [default: --version]
+pack() {
+  src="$BATS_TEST_TMPDIR/pack"
+  rm -rf "$src"
+  mkdir -p "$src"
+  echo "$2" >"$src/README.md"
+  for path in ${BINARIES-$2}; do
+    mkdir -p "$src/$(dirname "$path")"
+    # shellcheck disable=SC2016 # $1 belongs to the fake binary
+    printf '#!/bin/sh\n[ "$1" = %s ] || exit 2\necho "%s %s"\n' \
+      "${VERSION_FLAG:---version}" "$2" "${REPORTS:-$3}" >"$src/$path"
+    chmod 755 "$src/$path"
+  done
+  tar -czf "$1" -C "$src" .
 }
 
 # asset PRODUCT TAG FILE: serve FILE from release TAG of PRODUCT the way
@@ -148,6 +173,8 @@ on_tty() {
   assert_output --partial "USAGE"
   assert_output --partial "--no-color"
   assert_output --partial "PURPLECLAY_VERSION"
+  assert_output --partial "PURPLECLAY_DIR"
+  assert_output --partial "[default: ~/.local/bin, or /usr/local/bin as root]"
 }
 
 @test "a missing product fails with a hint" {
@@ -176,7 +203,8 @@ on_tty() {
   assert_line "    Resolved the latest release of nsv as v0.12.2"
   assert_line "  Downloaded nsv_0.12.2_linux_x86_64.tar.gz"
   assert_line "    Verified the checksum of nsv_0.12.2_linux_x86_64.tar.gz"
-  assert_line "     Warning Installing isn't supported yet, so nothing was installed"
+  assert_line "   Installed nsv v0.12.2 into $PURPLECLAY_DIR"
+  assert_line "     Checked nsv reports version 0.12.2"
 }
 
 @test "errors line up with the steps, with hints under the message" {
@@ -748,6 +776,227 @@ EOF
   assert_line --regexp '^ +\| GET /releases/download/v0\.12\.2/checksums\.txt returned 200 from release-assets\.githubusercontent\.com$'
   assert_line --regexp '^ +\| Selected +nsv_0\.12\.2_linux_x86_64\.tar\.gz$'
   refute_output --partial "s3cret"
+}
+
+# ---------------------------------------------------------------------------
+# Installing
+# ---------------------------------------------------------------------------
+
+# locked DIR: create DIR, then stop the test user writing to it. root can
+# write to it anyway, so tests that need a locked directory skip as root.
+locked() {
+  [ "$(id -u)" != 0 ] || skip "root can write to any directory"
+  mkdir -p "$1"
+  chmod 555 "$1"
+}
+
+@test "installs the binary into PURPLECLAY_DIR, creating it, or into --dir" {
+  run "$INSTALLER" nsv
+  assert_success
+  run "$PURPLECLAY_DIR/nsv" --version
+  assert_output "nsv 0.12.2"
+
+  for flag in --dir -d; do
+    run "$INSTALLER" "$flag" "$BATS_TEST_TMPDIR/other$flag" nsv
+    assert_success
+    assert_line "   Installed nsv v0.12.2 into $BATS_TEST_TMPDIR/other$flag"
+    [ -x "$BATS_TEST_TMPDIR/other$flag/nsv" ]
+  done
+}
+
+@test "a relative --dir is resolved against the current directory" {
+  cd "$BATS_TEST_TMPDIR"
+  run "$INSTALLER" --dir relative/bin nsv
+  assert_success
+  assert_line "   Installed nsv v0.12.2 into $BATS_TEST_TMPDIR/relative/bin"
+  [ -x "$BATS_TEST_TMPDIR/relative/bin/nsv" ]
+}
+
+@test "replaces an existing binary, leaving nothing else behind" {
+  mkdir -p "$PURPLECLAY_DIR"
+  echo "old" >"$PURPLECLAY_DIR/nsv"
+  run "$INSTALLER" nsv
+  assert_success
+  run "$PURPLECLAY_DIR/nsv" --version
+  assert_output "nsv 0.12.2"
+  run ls -A "$PURPLECLAY_DIR"
+  assert_output "nsv"
+}
+
+@test "a directory that isn't writable fails, without asking for more privileges" {
+  locked "$BATS_TEST_TMPDIR/locked"
+  for dir in "$BATS_TEST_TMPDIR/locked" "$BATS_TEST_TMPDIR/locked/bin"; do
+    run "$INSTALLER" --dir "$dir" nsv
+    assert_failure
+    assert_output --partial "Error $BATS_TEST_TMPDIR/locked isn't writable, so nsv can't be installed into $dir"
+    assert_output --partial "Choose a directory you can write to with --dir, or run the installer as root"
+  done
+}
+
+@test "installs into ~/.local/bin by default" {
+  # As root it would install into the real /usr/local/bin
+  [ "$(id -u)" != 0 ] || skip "root installs into /usr/local/bin by default"
+  unset PURPLECLAY_DIR
+  export HOME="$BATS_TEST_TMPDIR/home"
+  run "$INSTALLER" nsv
+  assert_success
+  assert_line "   Installed nsv v0.12.2 into $HOME/.local/bin"
+  [ -x "$HOME/.local/bin/nsv" ]
+}
+
+@test "finds the binary inside a single nested directory" {
+  BINARIES="nsv_0.12.2_linux_x86_64/nsv" release nsv v0.12.2 nsv_0.12.2_linux_x86_64.tar.gz
+  run "$INSTALLER" nsv
+  assert_success
+  assert_line "   Installed nsv v0.12.2 into $PURPLECLAY_DIR"
+}
+
+@test "an archive without the binary, or with two, fails" {
+  BINARIES="" release nsv v0.12.2 nsv_0.12.2_linux_x86_64.tar.gz
+  run "$INSTALLER" nsv
+  assert_failure
+  assert_output --partial "Error nsv_0.12.2_linux_x86_64.tar.gz doesn't contain the nsv binary"
+
+  BINARIES="nsv other/nsv" release nsv v0.12.2 nsv_0.12.2_linux_x86_64.tar.gz
+  run "$INSTALLER" nsv
+  assert_failure
+  assert_output --partial "Error nsv_0.12.2_linux_x86_64.tar.gz contains more than one nsv binary"
+  [ ! -e "$PURPLECLAY_DIR/nsv" ]
+}
+
+@test "the version check falls back to -V" {
+  VERSION_FLAG=-V release nsv v0.12.2 nsv_0.12.2_linux_x86_64.tar.gz
+  run "$INSTALLER" nsv
+  assert_success
+  assert_line "     Checked nsv reports version 0.12.2"
+}
+
+@test "the version check runs the verified binary, not another copy on PATH" {
+  printf '#!/bin/sh\necho "nsv 9.9.9"\n' >"$BIN/nsv"
+  chmod 755 "$BIN/nsv"
+  run "$INSTALLER" nsv
+  assert_success
+  assert_line "     Checked nsv reports version 0.12.2"
+}
+
+@test "the version check passes before the binary is installed" {
+  run "$INSTALLER" nsv
+  assert_success
+  assert_output --partial "$(printf '%s\n%s' \
+    "     Checked nsv reports version 0.12.2" \
+    "   Installed nsv v0.12.2 into $PURPLECLAY_DIR")"
+}
+
+@test "a failed version check leaves an existing binary in place" {
+  mkdir -p "$PURPLECLAY_DIR"
+  printf '#!/bin/sh\necho "nsv 0.12.1"\n' >"$PURPLECLAY_DIR/nsv"
+  chmod 755 "$PURPLECLAY_DIR/nsv"
+  REPORTS=9.9.9 release nsv v0.12.2 nsv_0.12.2_linux_x86_64.tar.gz
+  run "$INSTALLER" nsv
+  assert_failure
+  run "$PURPLECLAY_DIR/nsv"
+  assert_output "nsv 0.12.1"
+  run ls -A "$PURPLECLAY_DIR"
+  assert_output "nsv"
+}
+
+@test "a binary reporting another version, or none, fails the version check" {
+  REPORTS=9.9.9 release nsv v0.12.2 nsv_0.12.2_linux_x86_64.tar.gz
+  run "$INSTALLER" nsv
+  assert_failure
+  assert_output --partial "Error nsv_0.12.2_linux_x86_64.tar.gz reports nsv 9.9.9 rather than version 0.12.2"
+
+  VERSION_FLAG=--other release nsv v0.12.2 nsv_0.12.2_linux_x86_64.tar.gz
+  run "$INSTALLER" nsv
+  assert_failure
+  assert_output --partial "Error nsv_0.12.2_linux_x86_64.tar.gz reports nothing rather than version 0.12.2"
+  assert_output --partial "Report this at $GITHUB/nsv/issues"
+}
+
+@test "the version check compares whole versions, not parts of them" {
+  for reported in 0.12.20 10.12.2 0.12.2.1; do
+    REPORTS=$reported release nsv v0.12.2 nsv_0.12.2_linux_x86_64.tar.gz
+    run "$INSTALLER" nsv
+    assert_failure
+    assert_output --partial "reports nsv $reported rather than version 0.12.2"
+  done
+
+  for reported in v0.12.2 "(0.12.2)"; do
+    REPORTS=$reported release nsv v0.12.2 nsv_0.12.2_linux_x86_64.tar.gz
+    run "$INSTALLER" nsv
+    assert_success
+    assert_line "     Checked nsv reports version 0.12.2"
+  done
+}
+
+@test "a directory where the binary goes fails, before anything is installed" {
+  mkdir -p "$PURPLECLAY_DIR/nsv"
+  run "$INSTALLER" nsv
+  assert_failure
+  assert_output --partial "Error $PURPLECLAY_DIR/nsv is a directory, so nsv can't be installed there"
+  run ls -A "$PURPLECLAY_DIR/nsv"
+  assert_output ""
+  run ls -A "$PURPLECLAY_DIR"
+  assert_output "nsv"
+}
+
+@test "an install interrupted before the rename leaves nothing behind" {
+  # Interrupts the installer while it renames the staged binary into place
+  rm "$BIN/mv"
+  # shellcheck disable=SC2016 # $PPID belongs to the stub mv
+  printf '#!/bin/sh\nkill -TERM "$PPID"\n' >"$BIN/mv"
+  chmod 755 "$BIN/mv"
+  run "$INSTALLER" nsv
+  assert_failure
+  run ls -A "$PURPLECLAY_DIR"
+  assert_output ""
+  run find "$TMPDIR" -mindepth 1
+  assert_output ""
+}
+
+@test "as root, a directory other users could change is refused before installing" {
+  [ "$(id -u)" != 0 ] || skip "needs directories owned by a user other than root"
+  # Pretends to be root. The test's own directories belong to the test user.
+  rm "$BIN/id"
+  printf '#!/bin/sh\necho 0\n' >"$BIN/id"
+  chmod 755 "$BIN/id"
+
+  run "$INSTALLER" nsv
+  assert_failure
+  assert_output --partial "can be changed by users other than root, so installing into $PURPLECLAY_DIR as root isn't safe"
+  assert_output --partial "Install into a directory only root can change, such as /usr/local/bin, or run the installer as a normal user"
+  [ ! -e "$PURPLECLAY_DIR/nsv" ]
+}
+
+@test "as root, . or .. in a directory still to be created is refused" {
+  rm "$BIN/id"
+  printf '#!/bin/sh\necho 0\n' >"$BIN/id"
+  chmod 755 "$BIN/id"
+
+  for dir in "$BATS_TEST_TMPDIR/new/../../elsewhere/bin" "$BATS_TEST_TMPDIR/new/./bin" "$BATS_TEST_TMPDIR/new/.."; do
+    run "$INSTALLER" --dir "$dir" nsv
+    assert_failure
+    assert_output --partial "Error $dir uses . or .. in a part that doesn't exist yet, so where it leads can't be checked"
+    assert_output --partial "Give the directory without . or .., then try again"
+  done
+}
+
+@test "warns when the install directory isn't on PATH" {
+  run "$INSTALLER" nsv
+  assert_success
+  assert_output --partial "$(printf '%s\n%s' \
+    "     Warning $PURPLECLAY_DIR isn't on your PATH, so run nsv with its full path" \
+    "             Add it to PATH in your shell's profile, then open a new terminal, to run nsv by name")"
+
+  # The installer runs with BIN as its PATH
+  run "$INSTALLER" --dir "$BIN" nsv
+  assert_success
+  refute_output --partial "isn't on your PATH"
+
+  # A trailing slash in PATH names the same directory
+  TEST_PATH="$BIN:$PURPLECLAY_DIR/" run "$INSTALLER" nsv
+  assert_success
+  refute_output --partial "isn't on your PATH"
 }
 
 # ---------------------------------------------------------------------------
