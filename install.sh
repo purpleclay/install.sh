@@ -133,11 +133,12 @@ warn() {
 }
 
 # die MESSAGE [HINT...]: a failed step, followed by hints on what to do next.
+# A hint can span several lines.
 die() {
   printf '%s %s\n' "$(label 31 Error)" "$1" >&2
   shift
   for _hint in "$@"; do
-    printf '%s%s\n' "$INDENT" "$_hint" >&2
+    printf '%s\n' "$_hint" | sed "s/^/$INDENT/" >&2
   done
   exit 1
 }
@@ -376,8 +377,8 @@ GITHUB_OWNER="purpleclay"
 # init_downloader: use curl if it's installed, otherwise wget, and set the
 # options every request uses. Without timeouts a stalled connection would hang
 # the installer: curl has no time limit by default, and GNU wget retries 20
-# times. An overall limit suits only small requests, so head_request adds one
-# and downloads won't.
+# times. An overall limit suits only small requests, so request adds one to
+# HEAD requests and not to downloads.
 init_downloader() {
   if have curl; then
     DOWNLOADER=curl
@@ -397,18 +398,32 @@ init_downloader() {
   debug "Requests use $DOWNLOADER $DOWNLOADER_OPTS"
 }
 
-# head_request URL: sets STATUS and LOCATION from the response headers. When
-# github.com couldn't be reached, STATUS is empty and NET_ERROR holds the
-# downloader's exit code and message. curl reports the first response; wget
-# follows redirects, so it reports the last status and Location seen.
-head_request() {
+# request URL [FILE]: sets STATUS and LOCATION from the response headers.
+# Without FILE it's a HEAD request. With FILE, redirects are followed and the
+# body is saved to FILE. When github.com couldn't be reached, STATUS is empty
+# and NET_ERROR holds the downloader's exit code and message. A HEAD request
+# with curl reports the first response; otherwise redirects are followed, so
+# the last status and Location seen are reported.
+request() {
   _rc=0
-  if [ "$DOWNLOADER" = curl ]; then
+  if [ "$DOWNLOADER" = curl ] && [ $# -eq 2 ]; then
+    # --proto applies only to the first request, so redirects are limited to
+    # HTTPS separately. -D - prints every response's headers. A stalled
+    # download is stopped, rather than one that is only slow, so large files
+    # aren't cut off.
     # shellcheck disable=SC2086 # DOWNLOADER_OPTS holds whole flags only
+    _out=$(curl -sS -L --proto-redir =https -D - -o "$2" $DOWNLOADER_OPTS --speed-limit 1 --speed-time 30 "$1" 2>&1) || _rc=$?
+  elif [ "$DOWNLOADER" = curl ]; then
+    # shellcheck disable=SC2086
     _out=$(curl -sS -I --max-time 30 $DOWNLOADER_OPTS "$1" 2>&1) || _rc=$?
   else
-    # shellcheck disable=SC2086
-    _out=$(wget -S --spider $DOWNLOADER_OPTS "$1" 2>&1) || _rc=$?
+    if [ $# -eq 2 ]; then
+      # shellcheck disable=SC2086
+      _out=$(wget -S -O "$2" $DOWNLOADER_OPTS "$1" 2>&1) || _rc=$?
+    else
+      # shellcheck disable=SC2086
+      _out=$(wget -S --spider $DOWNLOADER_OPTS "$1" 2>&1) || _rc=$?
+    fi
     # busybox wget built with its own TLS, rather than Alpine's ssl_client,
     # accepts any certificate. Releases could then be swapped in transit,
     # checksums included, so stop before anything it returned is used.
@@ -423,7 +438,7 @@ head_request() {
   STATUS=$(printf '%s\n' "$_out" | awk '$1 ~ /^HTTP\// { s = $2 } END { print s }')
   LOCATION=$(printf '%s\n' "$_out" | awk 'tolower($1) == "location:" { l = $2 } END { print l }')
 
-  # curl only fails on a network error, as -I doesn't fail on HTTP errors.
+  # curl only fails on a network error, as it's run without -f.
   # wget also fails on an HTTP error, which ends on a 4xx or 5xx status. As
   # wget follows redirects, failing after any other status means a redirect
   # target couldn't be reached.
@@ -443,11 +458,33 @@ head_request() {
   # Shown relative to the repository, to keep debug output short. The
   # repository's own URL is shown once, by resolve_tag.
   _repo="$GITHUB_URL/$GITHUB_OWNER/$PRODUCT"
-  if [ -n "$STATUS" ]; then
+  _method=HEAD
+  [ $# -lt 2 ] || _method=GET
+  if [ -z "$STATUS" ]; then
+    debug "$_method ${1#"$_repo"} failed with exit code $_rc${NET_ERROR:+: $NET_ERROR}"
+  elif [ $# -lt 2 ]; then
     debug "HEAD ${1#"$_repo"} returned $STATUS${LOCATION:+, redirecting to ${LOCATION#"$_repo"}}"
   else
-    debug "HEAD ${1#"$_repo"} failed with exit code $_rc${NET_ERROR:+: $NET_ERROR}"
+    # Downloads redirect to signed URLs, which mustn't end up in a bug
+    # report, so only the host is shown.
+    _host="${LOCATION#*://}"
+    debug "GET ${1#"$_repo"} returned $STATUS${LOCATION:+ from ${_host%%/*}}"
   fi
+}
+
+# download URL FILE: save URL to FILE. Returns once STATUS is 200 or 404, and
+# stops with a clear reason otherwise.
+download() {
+  request "$1" "$2"
+  check_status
+  case "$LOCATION" in
+    "" | https://*) ;;
+    *) die "The download was redirected to $LOCATION, which isn't HTTPS" ;;
+  esac
+  case "$STATUS" in
+    200 | 404) ;;
+    *) die "Got an unexpected response from github.com (HTTP $STATUS)" ;;
+  esac
 }
 
 # check_status: stop with a clear reason for anything other than success, a
@@ -481,7 +518,7 @@ resolve_tag() {
 }
 
 resolve_latest_tag() {
-  head_request "$1/releases/latest"
+  request "$1/releases/latest"
   check_status
   [ "$STATUS" != 404 ] || not_found
   case "$LOCATION" in
@@ -504,13 +541,13 @@ resolve_version_tag() {
     *) _other="v$OPT_VERSION" ;;
   esac
   for TAG in "$OPT_VERSION" "$_other"; do
-    head_request "$1/releases/tag/$TAG"
+    request "$1/releases/tag/$TAG"
     check_status
     [ "$STATUS" != 200 ] || return 0
   done
 
   # Neither tag exists. Check the product does, for a clearer error.
-  head_request "$1/releases/latest"
+  request "$1/releases/latest"
   check_status
   [ "$STATUS" != 404 ] || not_found
   die "There is no release $OPT_VERSION of $PRODUCT" "See $1/releases for the available versions"
@@ -558,6 +595,101 @@ unexpected_response() {
 }
 
 # ---------------------------------------------------------------------------
+# Archives and checksums
+# ---------------------------------------------------------------------------
+
+# init_workdir: sets WORK to a temporary directory, removed when the
+# installer exits, whether it succeeded or not.
+init_workdir() {
+  WORK=$(mktemp -d) || die "Couldn't create a temporary directory" "Check that TMPDIR, or /tmp, is writable"
+  trap 'rm -rf "$WORK"' EXIT
+  # A signal doesn't run the EXIT trap in every shell, but exit does
+  trap 'exit 1' HUP INT TERM
+  debug "Downloads are saved to $WORK"
+}
+
+# fetch_checksums: downloads the release's checksums.txt to WORK.
+fetch_checksums() {
+  _repo="$GITHUB_URL/$GITHUB_OWNER/$PRODUCT"
+  download "$_repo/releases/download/$TAG/checksums.txt" "$WORK/checksums.txt"
+  [ "$STATUS" != 404 ] || die "Release $TAG of $PRODUCT has no checksums.txt, so it can't be verified" \
+    "It was published before the installer could verify downloads" \
+    "See $_repo#install for other ways to install it"
+}
+
+# select_asset: sets ASSET and ASSET_SHA to the one archive in checksums.txt
+# built for this platform. An archive matches when its name starts with the
+# product and holds an OS and an architecture as whole words, separated by
+# - _ or . from the rest, so a part of a word never matches.
+select_asset() {
+  case "$ARCH" in
+    x86_64) _arch='x86_64|amd64' ;;
+    arm64) _arch='arm64|aarch64' ;;
+  esac
+  # Names are checked before they're put into a URL or path
+  _archives=$(awk -v p="$PRODUCT" '
+    { f = $2; sub(/^\*/, "", f) }
+    length($1) == 64 && $1 !~ /[^0-9A-Fa-f]/ && f ~ /^[0-9A-Za-z._+-]+\.tar\.gz$/ &&
+      index(f, p) == 1 && substr(f, length(p) + 1, 1) ~ /[-_]/ { print tolower($1), f }
+  ' "$WORK/checksums.txt")
+  _matches=$(printf '%s\n' "$_archives" | awk -v os="$OS" -v arch="$_arch" '
+    $2 ~ ("(^|[-_.])(" os ")([-_.]|$)") && $2 ~ ("(^|[-_.])(" arch ")([-_.]|$)")')
+
+  case $(printf '%s' "$_matches" | awk 'END { print NR }') in
+    0)
+      if [ -n "$_archives" ]; then
+        die "There is no build for $OS/$ARCH in release $TAG of $PRODUCT" "The release has these archives:" \
+          "$(printf '%s\n' "$_archives" | awk '{ print "  " $2 }')"
+      fi
+      die "There is no build for $OS/$ARCH in release $TAG of $PRODUCT" \
+        "Its checksums.txt lists no .tar.gz archives of $PRODUCT"
+      ;;
+    1) ;;
+    *)
+      die "More than one build matches $OS/$ARCH in release $TAG of $PRODUCT" "It's not clear which of these to install:" \
+        "$(printf '%s\n' "$_matches" | awk '{ print "  " $2 }')"
+      ;;
+  esac
+  ASSET_SHA="${_matches%% *}"
+  ASSET="${_matches#* }"
+  debug_pair Selected "$ASSET"
+  debug_pair "Expected SHA-256" "$ASSET_SHA"
+}
+
+download_asset() {
+  ARCHIVE="$WORK/$ASSET"
+  download "$GITHUB_URL/$GITHUB_OWNER/$PRODUCT/releases/download/$TAG/$ASSET" "$ARCHIVE"
+  [ "$STATUS" != 404 ] || die "Couldn't download $ASSET (HTTP 404)" \
+    "Release $TAG of $PRODUCT lists it in checksums.txt, but doesn't include it"
+}
+
+# verify_checksum: the archive's SHA-256 must match checksums.txt. There's
+# deliberately no way to skip this.
+verify_checksum() {
+  if have sha256sum; then
+    _tool=sha256sum _sum=$(sha256sum "$ARCHIVE" | awk '{ print $1 }')
+  elif have shasum; then
+    _tool=shasum _sum=$(shasum -a 256 "$ARCHIVE" | awk '{ print $1 }')
+  elif have openssl; then
+    _tool=openssl _sum=$(openssl dgst -sha256 "$ARCHIVE" | awk '{ print $NF }')
+  else
+    die "There is no tool to compute a SHA-256 checksum with" "Install sha256sum, shasum or openssl, then try again"
+  fi
+  _sum=$(printf '%s' "$_sum" | tr 'A-F' 'a-f')
+  debug_pair "Computed with" "$_tool"
+  debug_pair "Actual SHA-256" "$_sum"
+  [ -n "$_sum" ] || die "$_tool couldn't compute the checksum of $ASSET"
+
+  if [ "$_sum" != "$ASSET_SHA" ]; then
+    rm -f "$ARCHIVE"
+    die "The checksum of $ASSET doesn't match checksums.txt" \
+      "Expected $ASSET_SHA" \
+      "Got      $_sum" \
+      "The download may be corrupt or tampered with, so it was deleted"
+  fi
+}
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -601,7 +733,18 @@ main() {
     done_step Resolved "the latest release of $PRODUCT as $TAG"
   fi
 
-  warn "Downloads aren't supported yet, so nothing was installed"
+  begin Downloading "the $OS/$ARCH build of $PRODUCT $TAG"
+  init_workdir
+  fetch_checksums
+  select_asset
+  download_asset
+  done_step Downloaded "$ASSET"
+
+  begin Verifying "the checksum of $ASSET"
+  verify_checksum
+  done_step Verified "the checksum of $ASSET"
+
+  warn "Installing isn't supported yet, so nothing was installed"
 }
 
 main "$@"

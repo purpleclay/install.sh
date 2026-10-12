@@ -1,8 +1,9 @@
 #!/bin/sh
-# Stub wget: answers --spider requests from the routes in STUB_ROUTES, one
-# "URL STATUS [LOCATION]" per line, following redirects and printing each
-# response's headers to stderr like wget -S. A URL with no route fails like a
-# network error. Each call is appended to STUB_LOG.
+# Stub wget: answers requests from the routes in STUB_ROUTES, one
+# "URL STATUS [LOCATION | @FILE]" per line, following redirects and printing
+# each response's headers to stderr like wget -S. A download (-O OUT) saves
+# the contents of FILE to OUT. A URL with no route fails like a network error.
+# Each call is appended to STUB_LOG.
 #
 # Behaves like GNU wget by default. STUB_WGET=busybox behaves like busybox
 # wget, which has neither --tries nor --https-only. STUB_WGET=busybox-insecure
@@ -26,7 +27,11 @@ case " $* " in
 esac
 
 echo "wget $*" >>"$STUB_LOG"
-for url; do :; done
+out=""
+for url; do
+  [ "${prev:-}" != -O ] || out="$url"
+  prev="$url"
+done
 [ "$flavour" != busybox-insecure ] || echo "wget: note: TLS certificate validation not implemented" >&2
 
 while :; do
@@ -39,11 +44,15 @@ while :; do
   # shellcheck disable=SC2086 # split the route into status and location
   set -- $route
   printf '  HTTP/1.1 %s\n' "$1" >&2
-  if [ -n "${2:-}" ]; then
-    printf '  Location: %s\n' "$2" >&2
-    url="$2"
-    continue
-  fi
+  case "${2:-}" in
+    "") ;;
+    @*) [ -z "$out" ] || cat "${2#@}" >"$out" ;;
+    *)
+      printf '  Location: %s\n' "$2" >&2
+      url="$2"
+      continue
+      ;;
+  esac
   [ "$1" = 200 ] || exit 8
   exit 0
 done

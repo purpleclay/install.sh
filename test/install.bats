@@ -23,11 +23,12 @@ setup() {
 
   BIN="$BATS_TEST_TMPDIR/bin"
   mkdir -p "$BIN"
-  for tool in awk cat grep sed tr; do
+  for tool in awk cat grep mktemp rm sed tr; do
     ln -s "$(command -v "$tool")" "$BIN/$tool"
   done
-  # Optional: detect_shell falls back to these, and minimal systems lack ps
-  for tool in ps readlink; do
+  # Optional: detect_shell falls back to ps and readlink, and minimal systems
+  # lack ps. Checksums use the first SHA-256 tool found.
+  for tool in ps readlink sha256sum shasum openssl; do
     ! tool_path=$(command -v "$tool") || ln -s "$tool_path" "$BIN/$tool"
   done
   for stub in "$BATS_TEST_DIRNAME"/stubs/*; do
@@ -48,13 +49,63 @@ EOF
 
   export STUB_ROUTES="$BATS_TEST_TMPDIR/routes" STUB_LOG="$BATS_TEST_TMPDIR/requests"
   : >"$STUB_LOG"
+  # The temporary directory is checked to be empty after a run
+  export TMPDIR="$BATS_TEST_TMPDIR/tmp"
+  mkdir -p "$TMPDIR"
+
   route "$GITHUB/nsv/releases/latest" 302 "$GITHUB/nsv/releases/tag/v0.12.2"
   route "$GITHUB/nsv/releases/tag/v0.12.2" 200
+  # As published by GoReleaser, with archives for other platforms and formats
+  release nsv v0.12.2 \
+    nsv-0.12.2-1.x86_64.rpm nsv_0.12.2_amd64.deb \
+    nsv_0.12.2_darwin_arm64.tar.gz nsv_0.12.2_darwin_arm64.tar.gz.sbom.json \
+    nsv_0.12.2_darwin_x86_64.tar.gz nsv_0.12.2_darwin_x86_64.tar.gz.sbom.json \
+    nsv_0.12.2_linux_arm64.tar.gz nsv_0.12.2_linux_armv7.tar.gz \
+    nsv_0.12.2_linux_x86_64.tar.gz nsv_0.12.2_linux_x86_64.tar.gz.sbom.json \
+    nsv_0.12.2_windows_x86_64.zip
 }
 
-# route URL STATUS [LOCATION]: how the stub curl and wget answer URL.
+# route URL STATUS [LOCATION | @FILE]: how the stub curl and wget answer URL,
+# serving the contents of FILE as the body.
 route() {
   echo "$*" >>"$STUB_ROUTES"
+}
+
+# release PRODUCT TAG FILE...: publish each FILE in release TAG of PRODUCT,
+# listed in its checksums.txt.
+release() {
+  product=$1 tag=$2
+  shift 2
+  dir="$BATS_TEST_TMPDIR/releases/$product/$tag"
+  mkdir -p "$dir"
+  : >"$dir/checksums.txt"
+  for file; do
+    printf '%s\n' "$product $tag $file" >"$dir/$file"
+    printf '%s  %s\n' "$(sha256 "$dir/$file")" "$file" >>"$dir/checksums.txt"
+    asset "$product" "$tag" "$file"
+  done
+  asset "$product" "$tag" checksums.txt
+}
+
+# asset PRODUCT TAG FILE: serve FILE from release TAG of PRODUCT the way
+# github.com does, through a redirect to a signed URL.
+asset() {
+  cdn="https://release-assets.githubusercontent.com/$1/$3?sig=s3cret"
+  route "$GITHUB/$1/releases/download/$2/$3" 302 "$cdn"
+  route "$cdn" 200 "@$BATS_TEST_TMPDIR/releases/$1/$2/$3"
+}
+
+# tamper PRODUCT TAG FILE: change FILE after its checksum was published.
+tamper() {
+  echo "tampered" >>"$BATS_TEST_TMPDIR/releases/$1/$2/$3"
+}
+
+sha256() {
+  if command -v sha256sum >/dev/null; then
+    sha256sum "$1"
+  else
+    shasum -a 256 "$1"
+  fi | awk '{ print $1 }'
 }
 
 # on_tty CMD...: run CMD on a pseudo-terminal, so the installer turns colour
@@ -123,7 +174,9 @@ on_tty() {
   assert_success
   assert_line "    Detected the host platform as linux/x86_64"
   assert_line "    Resolved the latest release of nsv as v0.12.2"
-  assert_line "     Warning Downloads aren't supported yet, so nothing was installed"
+  assert_line "  Downloaded nsv_0.12.2_linux_x86_64.tar.gz"
+  assert_line "    Verified the checksum of nsv_0.12.2_linux_x86_64.tar.gz"
+  assert_line "     Warning Installing isn't supported yet, so nothing was installed"
 }
 
 @test "errors line up with the steps, with hints under the message" {
@@ -362,6 +415,9 @@ on_tty() {
   run cat "$STUB_LOG"
   assert_output --partial "--max-time 30"
   assert_output --partial "--connect-timeout 10"
+  # Downloads stop only when stalled, so large files aren't cut off
+  assert grep -q -- ' -o .*--speed-limit 1 --speed-time 30' "$STUB_LOG"
+  refute grep -q -- ' -o .*--max-time' "$STUB_LOG"
 
   rm "$BIN/curl"
   : >"$STUB_LOG"
@@ -379,6 +435,7 @@ on_tty() {
 @test "a version resolves with or without a v, for v-prefixed tags" {
   route "$GITHUB/go-tool/releases/tag/v0.1.0" 200
   route "$GITHUB/go-tool/releases/tag/0.1.0" 404
+  release go-tool v0.1.0 go-tool-v0.1.0-linux-amd64.tar.gz
   for version in 0.1.0 v0.1.0; do
     run "$INSTALLER" --version "$version" go-tool
     assert_success
@@ -389,6 +446,7 @@ on_tty() {
 @test "a version resolves with or without a v, for unprefixed tags" {
   route "$GITHUB/rust-tool/releases/tag/0.1.0" 200
   route "$GITHUB/rust-tool/releases/tag/v0.1.0" 404
+  release rust-tool 0.1.0 rust-tool-0.1.0-x86_64-unknown-linux-musl.tar.gz
   for version in 0.1.0 v0.1.0; do
     run "$INSTALLER" -v "$version" rust-tool
     assert_success
@@ -507,6 +565,192 @@ EOF
 }
 
 # ---------------------------------------------------------------------------
+# Checksums
+# ---------------------------------------------------------------------------
+
+@test "the archive for the platform is chosen from checksums.txt" {
+  for platform in "Linux x86_64 linux_x86_64" "Linux aarch64 linux_arm64" \
+    "Darwin x86_64 darwin_x86_64" "Darwin arm64 darwin_arm64"; do
+    # shellcheck disable=SC2086 # split into OS, architecture and expected
+    set -- $platform
+    STUB_OS=$1 STUB_ARCH=$2 run "$INSTALLER" nsv
+    assert_success
+    assert_line "  Downloaded nsv_0.12.2_$3.tar.gz"
+    assert_line "    Verified the checksum of nsv_0.12.2_$3.tar.gz"
+  done
+}
+
+@test "Rust target triples and their architecture names are understood" {
+  route "$GITHUB/release-note/releases/latest" 302 "$GITHUB/release-note/releases/tag/0.12.0"
+  release release-note 0.12.0 \
+    release-note-0.12.0-aarch64-apple-darwin.tar.gz \
+    release-note-0.12.0-aarch64-apple-darwin.tar.gz.spdx.json \
+    release-note-0.12.0-aarch64-unknown-linux-musl.tar.gz \
+    release-note-0.12.0-x86_64-apple-darwin.tar.gz \
+    release-note-0.12.0-x86_64-unknown-linux-musl.tar.gz
+  for platform in "Linux x86_64 x86_64-unknown-linux-musl" "Linux arm64 aarch64-unknown-linux-musl" \
+    "Darwin x86_64 x86_64-apple-darwin" "Darwin arm64 aarch64-apple-darwin"; do
+    # shellcheck disable=SC2086 # split into OS, architecture and expected
+    set -- $platform
+    STUB_OS=$1 STUB_ARCH=$2 run "$INSTALLER" release-note
+    assert_success
+    assert_line "    Verified the checksum of release-note-0.12.0-$3.tar.gz"
+  done
+}
+
+@test "an x86_64 shell under Rosetta downloads the arm64 archive" {
+  STUB_OS=Darwin STUB_ARCH=x86_64 STUB_ROSETTA=1 run "$INSTALLER" nsv
+  assert_success
+  assert_line "  Downloaded nsv_0.12.2_darwin_arm64.tar.gz"
+}
+
+@test "only whole words in archives of the product match, never parts of them" {
+  route "$GITHUB/odd/releases/latest" 302 "$GITHUB/odd/releases/tag/v1.0.0"
+  release odd v1.0.0 \
+    odd_1.0.0_linux_x86_64v2.tar.gz odd_1.0.0_linuxish_amd64.tar.gz \
+    oddity_1.0.0_linux_x86_64.tar.gz other-odd_1.0.0_linux_x86_64.tar.gz \
+    odd_1.0.0_linux_x86_64.zip odd_1.0.0_linux_x86_64.tar.gz.sbom.json
+  run "$INSTALLER" odd
+  assert_failure
+  assert_output --partial "There is no build for linux/x86_64 in release v1.0.0 of odd"
+  refute grep -q "releases/download/v1.0.0/odd" "$STUB_LOG"
+}
+
+@test "no build for the platform lists the archives there are" {
+  route "$GITHUB/mac-only/releases/latest" 302 "$GITHUB/mac-only/releases/tag/v1.0.0"
+  release mac-only v1.0.0 mac-only_1.0.0_darwin_arm64.tar.gz mac-only_1.0.0_darwin_x86_64.tar.gz
+  run "$INSTALLER" mac-only
+  assert_failure
+  assert_output --partial "$(printf '%s\n%s\n%s\n%s' \
+    "       Error There is no build for linux/x86_64 in release v1.0.0 of mac-only" \
+    "             The release has these archives:" \
+    "               mac-only_1.0.0_darwin_arm64.tar.gz" \
+    "               mac-only_1.0.0_darwin_x86_64.tar.gz")"
+}
+
+@test "more than one matching build fails, listing them" {
+  route "$GITHUB/two-libc/releases/latest" 302 "$GITHUB/two-libc/releases/tag/1.0.0"
+  release two-libc 1.0.0 \
+    two-libc-1.0.0-x86_64-unknown-linux-gnu.tar.gz \
+    two-libc-1.0.0-x86_64-unknown-linux-musl.tar.gz
+  run "$INSTALLER" two-libc
+  assert_failure
+  assert_output --partial "$(printf '%s\n%s\n%s\n%s' \
+    "       Error More than one build matches linux/x86_64 in release 1.0.0 of two-libc" \
+    "             It's not clear which of these to install:" \
+    "               two-libc-1.0.0-x86_64-unknown-linux-gnu.tar.gz" \
+    "               two-libc-1.0.0-x86_64-unknown-linux-musl.tar.gz")"
+}
+
+@test "a release without checksums.txt is refused" {
+  route "$GITHUB/legacy/releases/latest" 302 "$GITHUB/legacy/releases/tag/v0.1.0"
+  route "$GITHUB/legacy/releases/download/v0.1.0/checksums.txt" 404
+  run "$INSTALLER" legacy
+  assert_failure
+  assert_output --partial "Release v0.1.0 of legacy has no checksums.txt, so it can't be verified"
+  assert_output --partial "See $GITHUB/legacy#install for other ways to install it"
+}
+
+@test "an archive listed in checksums.txt but missing from the release fails" {
+  : >"$STUB_ROUTES"
+  route "$GITHUB/nsv/releases/latest" 302 "$GITHUB/nsv/releases/tag/v0.12.2"
+  route "$GITHUB/nsv/releases/download/v0.12.2/nsv_0.12.2_linux_x86_64.tar.gz" 404
+  release nsv v0.12.2 nsv_0.12.2_linux_x86_64.tar.gz
+  run "$INSTALLER" nsv
+  assert_failure
+  assert_output --partial "Couldn't download nsv_0.12.2_linux_x86_64.tar.gz (HTTP 404)"
+}
+
+@test "a tampered archive fails, is deleted, and nothing else happens" {
+  tamper nsv v0.12.2 nsv_0.12.2_linux_x86_64.tar.gz
+  expected=$(awk '$2 == "nsv_0.12.2_linux_x86_64.tar.gz" { print $1 }' \
+    "$BATS_TEST_TMPDIR/releases/nsv/v0.12.2/checksums.txt")
+  actual=$(sha256 "$BATS_TEST_TMPDIR/releases/nsv/v0.12.2/nsv_0.12.2_linux_x86_64.tar.gz")
+  run "$INSTALLER" nsv
+  assert_failure
+  assert_output --partial "$(printf '%s\n%s\n%s\n%s' \
+    "       Error The checksum of nsv_0.12.2_linux_x86_64.tar.gz doesn't match checksums.txt" \
+    "             Expected $expected" \
+    "             Got      $actual" \
+    "             The download may be corrupt or tampered with, so it was deleted")"
+  refute_output --partial "Verified"
+  refute_output --partial "Warning"
+  run find "$TMPDIR" -mindepth 1
+  assert_output ""
+}
+
+@test "the checksum check can't be turned off" {
+  tamper nsv v0.12.2 nsv_0.12.2_linux_x86_64.tar.gz
+  run "$INSTALLER" --skip-checksum nsv
+  assert_failure
+  assert_output --partial "Unknown flag '--skip-checksum'"
+
+  PURPLECLAY_SKIP_CHECKSUM=true PURPLECLAY_INSECURE=true run "$INSTALLER" nsv
+  assert_failure
+  assert_output --partial "doesn't match checksums.txt"
+}
+
+@test "checksums use sha256sum, then shasum, then openssl" {
+  for tool in sha256sum shasum openssl; do
+    [ -e "$BIN/$tool" ] || skip "$tool isn't installed"
+  done
+  for tool in sha256sum shasum openssl; do
+    run "$INSTALLER" --debug nsv
+    assert_success
+    assert_line --regexp "^ +\\| Computed with +$tool\$"
+    assert_line "    Verified the checksum of nsv_0.12.2_linux_x86_64.tar.gz"
+    rm "${BIN:?}/${tool:?}"
+  done
+
+  run "$INSTALLER" nsv
+  assert_failure
+  assert_output --partial "There is no tool to compute a SHA-256 checksum with"
+  assert_output --partial "Install sha256sum, shasum or openssl, then try again"
+}
+
+@test "temporary files are removed after success and failure" {
+  run "$INSTALLER" nsv
+  assert_success
+  run find "$TMPDIR" -mindepth 1
+  assert_output ""
+
+  route "$GITHUB/mac-only/releases/latest" 302 "$GITHUB/mac-only/releases/tag/v1.0.0"
+  release mac-only v1.0.0 mac-only_1.0.0_darwin_arm64.tar.gz
+  run "$INSTALLER" mac-only
+  assert_failure
+  run find "$TMPDIR" -mindepth 1
+  assert_output ""
+}
+
+@test "downloads follow redirects only to HTTPS" {
+  run "$INSTALLER" nsv
+  assert_success
+  run grep "releases/download" "$STUB_LOG"
+  assert_output --partial "--proto-redir =https"
+  assert_output --partial "--proto =https"
+
+  # busybox wget can't be told to stay on HTTPS, so where it ended up is checked
+  rm "${BIN:?}/curl"
+  : >"$STUB_ROUTES"
+  route "$GITHUB/nsv/releases/latest" 302 "$GITHUB/nsv/releases/tag/v0.12.2"
+  route "$GITHUB/nsv/releases/tag/v0.12.2" 200
+  route "$GITHUB/nsv/releases/download/v0.12.2/checksums.txt" 302 "http://cdn.example/checksums.txt"
+  route "http://cdn.example/checksums.txt" 200 "@$BATS_TEST_TMPDIR/releases/nsv/v0.12.2/checksums.txt"
+  STUB_WGET=busybox run "$INSTALLER" nsv
+  assert_failure
+  assert_output --partial "The download was redirected to http://cdn.example/checksums.txt, which isn't HTTPS"
+  refute_output --partial "Downloaded"
+}
+
+@test "debug output shows downloads without their signed URLs" {
+  run "$INSTALLER" --debug nsv
+  assert_success
+  assert_line --regexp '^ +\| GET /releases/download/v0\.12\.2/checksums\.txt returned 200 from release-assets\.githubusercontent\.com$'
+  assert_line --regexp '^ +\| Selected +nsv_0\.12\.2_linux_x86_64\.tar\.gz$'
+  refute_output --partial "s3cret"
+}
+
+# ---------------------------------------------------------------------------
 # Downloaders
 # ---------------------------------------------------------------------------
 
@@ -514,7 +758,7 @@ EOF
   rm "$BIN/wget"
   run "$INSTALLER" nsv
   assert_success
-  assert_output --partial "Resolved the latest release of nsv as v0.12.2"
+  assert_output --partial "Verified the checksum of nsv_0.12.2_linux_x86_64.tar.gz"
   run cat "$STUB_LOG"
   assert_output --regexp '^curl '
 }
@@ -523,7 +767,7 @@ EOF
   rm "$BIN/curl"
   run "$INSTALLER" nsv
   assert_success
-  assert_output --partial "Resolved the latest release of nsv as v0.12.2"
+  assert_output --partial "Verified the checksum of nsv_0.12.2_linux_x86_64.tar.gz"
   run cat "$STUB_LOG"
   assert_output --regexp '^wget .*--https-only'
 }
@@ -532,7 +776,7 @@ EOF
   rm "$BIN/curl"
   STUB_WGET=busybox run "$INSTALLER" nsv
   assert_success
-  assert_output --partial "Resolved the latest release of nsv as v0.12.2"
+  assert_output --partial "Verified the checksum of nsv_0.12.2_linux_x86_64.tar.gz"
 }
 
 @test "wget failing after a redirect is a network error, not a result" {
