@@ -66,6 +66,7 @@ jobs:
             api.github.com:443
             cache.nixos.org:443
             github.com:443
+            release-assets.githubusercontent.com:443
             releases.nixos.org:443
 
       - name: checkout

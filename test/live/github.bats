@@ -10,25 +10,28 @@ setup() {
   cd "$BATS_TEST_DIRNAME/../.." || exit 1
 }
 
-@test "resolves the latest release of a Go and a Rust product" {
-  run sh install.sh release-go-smoke-test
+@test "verifies the latest release of a Go and a Rust product" {
+  run sh install.sh nsv
   assert_success
-  assert_output --regexp 'Resolved the latest release of release-go-smoke-test as v[0-9]+\.[0-9]+\.[0-9]+'
+  assert_output --regexp 'Resolved the latest release of nsv as v[0-9]+\.[0-9]+\.[0-9]+'
+  assert_output --regexp 'Verified the checksum of nsv_[0-9.]+_(linux|darwin)_(x86_64|arm64)\.tar\.gz'
 
-  run sh install.sh release-rust-smoke-test
+  run sh install.sh release-note
   assert_success
-  assert_output --regexp 'Resolved the latest release of release-rust-smoke-test as [0-9]+\.[0-9]+\.[0-9]+'
+  assert_output --regexp 'Resolved the latest release of release-note as [0-9]+\.[0-9]+\.[0-9]+'
+  assert_output --regexp 'Verified the checksum of release-note-[0-9.]+-(x86_64|aarch64)-[a-z-]+\.tar\.gz'
 }
 
 @test "resolves a version with or without a v, for Go and Rust tags" {
-  for version in 0.1.0 v0.1.0; do
-    run sh install.sh --version "$version" release-go-smoke-test
+  for version in 0.12.2 v0.12.2; do
+    run sh install.sh --version "$version" nsv
     assert_success
-    assert_output --partial "Resolved release v0.1.0 of release-go-smoke-test"
-
-    run sh install.sh --version "$version" release-rust-smoke-test
+    assert_output --partial "Resolved release v0.12.2 of nsv"
+  done
+  for version in 0.12.0 v0.12.0; do
+    run sh install.sh --version "$version" release-note
     assert_success
-    assert_output --partial "Resolved release 0.1.0 of release-rust-smoke-test"
+    assert_output --partial "Resolved release 0.12.0 of release-note"
   done
 }
 
@@ -43,7 +46,7 @@ setup() {
 with_only_wget() {
   bin="$BATS_TEST_TMPDIR/bin"
   mkdir -p "$bin"
-  for tool in awk cat grep ps readlink sed sysctl tr uname; do
+  for tool in awk cat grep mktemp ps readlink rm sed sha256sum shasum openssl sysctl tr uname; do
     ! tool_path=$(command -v "$tool") || ln -sf "$tool_path" "$bin/$tool"
   done
   ln -sf "$1" "$bin/wget"
@@ -51,18 +54,20 @@ with_only_wget() {
   PATH="$bin" "$(command -v sh)" install.sh "$@"
 }
 
-@test "resolves releases with only GNU wget" {
+@test "verifies releases with only GNU wget" {
   gnu_wget=$(command -v wget) && wget --help 2>&1 | grep -q -- --https-only ||
     skip "GNU wget isn't installed"
 
-  run with_only_wget "$gnu_wget" release-go-smoke-test
+  run with_only_wget "$gnu_wget" nsv
   assert_success
-  assert_output --regexp 'Resolved the latest release of release-go-smoke-test as v[0-9]+\.[0-9]+\.[0-9]+'
+  assert_output --regexp 'Resolved the latest release of nsv as v[0-9]+\.[0-9]+\.[0-9]+'
+  assert_output --partial "Verified the checksum of nsv_"
 
   # The Rust tag has no v, so this also follows a 404 to the other form
-  run with_only_wget "$gnu_wget" --version v0.1.0 release-rust-smoke-test
+  run with_only_wget "$gnu_wget" --version v0.12.0 release-note
   assert_success
-  assert_output --partial "Resolved release 0.1.0 of release-rust-smoke-test"
+  assert_output --partial "Resolved release 0.12.0 of release-note"
+  assert_output --partial "Verified the checksum of release-note-0.12.0-"
 }
 
 @test "refuses a busybox wget that can't verify certificates" {
@@ -70,7 +75,7 @@ with_only_wget() {
   busybox wget -q --spider https://github.com 2>&1 | grep -q "validation not implemented" ||
     skip "this busybox verifies certificates"
 
-  run with_only_wget "$busybox" release-go-smoke-test
+  run with_only_wget "$busybox" nsv
   assert_failure
   assert_output --partial "This wget can't verify TLS certificates"
 }
