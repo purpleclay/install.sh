@@ -128,19 +128,26 @@ done_step() {
   printf '%s %s\n' "$(brand_label "$1")" "$2" >&2
 }
 
+# warn MESSAGE [HINT...]: something to know about, followed by hints.
 warn() {
   printf '%s %s\n' "$(label 33 Warning)" "$1" >&2
+  shift
+  hints "$@"
 }
 
 # die MESSAGE [HINT...]: a failed step, followed by hints on what to do next.
-# A hint can span several lines.
 die() {
   printf '%s %s\n' "$(label 31 Error)" "$1" >&2
   shift
+  hints "$@"
+  exit 1
+}
+
+# hints HINT...: lines under a warning or error. A hint can span several lines.
+hints() {
   for _hint in "$@"; do
     printf '%s\n' "$_hint" | sed "s/^/$INDENT/" >&2
   done
-  exit 1
 }
 
 # debug MESSAGE: detail for --debug, printed straight away.
@@ -171,7 +178,7 @@ debug_context() {
 
   # Settings the installer documents are always listed. Settings that
   # change how requests are made are listed only when set, to keep this short.
-  for _var in PURPLECLAY_DEBUG PURPLECLAY_VERSION NO_COLOR COLORTERM TERM LANG LC_ALL LC_CTYPE; do
+  for _var in PURPLECLAY_DEBUG PURPLECLAY_VERSION PURPLECLAY_DIR NO_COLOR COLORTERM TERM LANG LC_ALL LC_CTYPE; do
     eval "_value=\${$_var-(not set)}"
     debug_pair "$_var" "$_value"
   done
@@ -281,6 +288,7 @@ print_help() {
 
   printf '%s\n' "$(bold 'FLAGS')"
   help_flag "-v, --version <VERSION>" "Install a specific version, e.g. 1.2.3 or v1.2.3 [default: latest]" "PURPLECLAY_VERSION"
+  help_flag "-d, --dir <DIR>" "Directory to install into [default: ~/.local/bin, or /usr/local/bin as root]" "PURPLECLAY_DIR"
   help_flag "    --debug" "Print debug output" "PURPLECLAY_DEBUG"
   help_flag "    --no-color" "Disable colour" "NO_COLOR"
   help_flag "-h, --help" "Print this help"
@@ -292,6 +300,7 @@ print_help() {
 
 init_config() {
   OPT_VERSION="${PURPLECLAY_VERSION:-}"
+  OPT_DIR="${PURPLECLAY_DIR:-}"
   OPT_DEBUG="${PURPLECLAY_DEBUG:-false}"
   OPT_NO_COLOR=false
   OPT_HELP=false
@@ -305,6 +314,11 @@ parse_args() {
       -v | --version)
         [ $# -ge 2 ] || die "The $1 flag needs a value" "Run with --help to see usage"
         OPT_VERSION="$2"
+        shift
+        ;;
+      -d | --dir)
+        [ $# -ge 2 ] || die "The $1 flag needs a value" "Run with --help to see usage"
+        OPT_DIR="$2"
         shift
         ;;
       --debug) OPT_DEBUG=true ;;
@@ -334,6 +348,16 @@ check_args() {
     ! printf '%s\n' "$OPT_VERSION" | grep -Eq '^v?[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$'; then
     die "The version '$OPT_VERSION' isn't valid" "Use a semantic version such as 1.2.3 or v1.2.3"
   fi
+
+  [ -n "$OPT_DIR" ] || default_dir
+  # An absolute path, so it can be compared with PATH and its parents found
+  case "$OPT_DIR" in
+    /) ;;
+    /*) OPT_DIR="${OPT_DIR%/}" ;;
+    *) OPT_DIR="$PWD/${OPT_DIR%/}" ;;
+  esac
+  # As given, before root resolves any links, for comparing with PATH
+  DIR_GIVEN="$OPT_DIR"
 }
 
 # ---------------------------------------------------------------------------
@@ -602,10 +626,17 @@ unexpected_response() {
 # installer exits, whether it succeeded or not.
 init_workdir() {
   WORK=$(mktemp -d) || die "Couldn't create a temporary directory" "Check that TMPDIR, or /tmp, is writable"
-  trap 'rm -rf "$WORK"' EXIT
+  trap cleanup EXIT
   # A signal doesn't run the EXIT trap in every shell, but exit does
   trap 'exit 1' HUP INT TERM
   debug "Downloads are saved to $WORK"
+}
+
+# cleanup: remove the downloads, and a binary staged in the install directory
+# but not yet renamed into place, such as when the install is interrupted.
+cleanup() {
+  rm -rf "$WORK"
+  [ -z "${STAGED:-}" ] || rm -f "$STAGED"
 }
 
 # fetch_checksums: downloads the release's checksums.txt to WORK.
@@ -690,6 +721,181 @@ verify_checksum() {
 }
 
 # ---------------------------------------------------------------------------
+# Installing
+# ---------------------------------------------------------------------------
+
+# extract_binary: sets BINARY to the product's binary, found at the top of
+# the archive or inside a single directory.
+extract_binary() {
+  _dir="$WORK/extract"
+  if ! mkdir "$_dir" || ! _err=$(tar -xzf "$ARCHIVE" -C "$_dir" 2>&1); then
+    debug "tar reported: ${_err:-nothing}"
+    die "Couldn't extract $ASSET" "Run with --debug for details"
+  fi
+
+  BINARY="" _count=0
+  for _file in "$_dir/$PRODUCT" "$_dir"/*/"$PRODUCT"; do
+    [ -f "$_file" ] || continue
+    BINARY="$_file" _count=$((_count + 1))
+  done
+  _report="Report this at $GITHUB_URL/$GITHUB_OWNER/$PRODUCT/issues"
+  [ "$_count" -gt 0 ] || die "$ASSET doesn't contain the $PRODUCT binary" "$_report"
+  [ "$_count" -eq 1 ] || die "$ASSET contains more than one $PRODUCT binary" "$_report"
+  debug "Found ${BINARY#"$_dir/"} in $ASSET"
+}
+
+# default_dir: sets OPT_DIR to where to install without --dir. Root installs
+# for everyone, anyone else into their own ~/.local/bin, where the XDG base
+# directory specification puts a user's programs. The installer never asks
+# for more privileges than it runs with.
+default_dir() {
+  if [ "$(id -u)" = 0 ]; then
+    OPT_DIR=/usr/local/bin
+  elif [ -n "${HOME:-}" ]; then
+    OPT_DIR="$HOME/.local/bin"
+  else
+    die "HOME isn't set, so there's no default directory to install into" "Choose one with --dir"
+  fi
+}
+
+# check_writable: the install directory, or its nearest parent that exists
+# when it needs creating, must be writable.
+check_writable() {
+  _dir="$OPT_DIR"
+  while [ ! -d "$_dir" ]; do
+    _dir="${_dir%/*}"
+    [ -n "$_dir" ] || _dir=/
+  done
+  [ -w "$_dir" ] || die "$_dir isn't writable, so $PRODUCT can't be installed into $OPT_DIR" \
+    "Choose a directory you can write to with --dir, or run the installer as root"
+}
+
+# check_root_owned: as root, stop unless only root can change the install
+# directory and every directory above it. Otherwise another user could swap a
+# directory for a link, so root writes somewhere they chose, or replace the
+# binary root has just installed. A parent with the sticky bit, such as /tmp,
+# is fine, as other users can't rename what root owns there.
+check_root_owned() {
+  [ "$(id -u)" = 0 ] || return 0
+  # Directories root creates must be root's alone, whatever umask it was given
+  umask 022
+  _dir="$OPT_DIR"
+  while [ ! -d "$_dir" ]; do
+    _dir="${_dir%/*}"
+    [ -n "$_dir" ] || _dir=/
+  done
+  case "$_dir" in
+    /) _missing="$OPT_DIR" ;;
+    *) _missing="${OPT_DIR#"$_dir"}" ;;
+  esac
+  # Only directories that exist can be checked, so the part still to be
+  # created mustn't lead back out of them
+  case "$_missing/" in
+    */./* | */../*)
+      die "$DIR_GIVEN uses . or .. in a part that doesn't exist yet, so where it leads can't be checked" \
+        "Give the directory without . or .., then try again"
+      ;;
+  esac
+  # Check where it really is: through a symlink, the directories above the
+  # target matter, not the ones above the link. Root then writes through the
+  # path that was checked, so a link can't be changed afterwards to point
+  # somewhere else.
+  _dir=$(cd -P "$_dir" && pwd -P) || die "Couldn't resolve $OPT_DIR" "Check the path, then try again"
+  OPT_DIR="${_dir%/}$_missing"
+  [ -n "$OPT_DIR" ] || OPT_DIR=/
+
+  _parent=false
+  while :; do
+    # shellcheck disable=SC2046 # split ls into fields: mode, links, owner
+    set -- $(ls -ldn "$_dir")
+    _unsafe=false
+    [ "$3" = 0 ] || _unsafe=true
+    case "$1" in
+      ?????w* | ????????w*)
+        case "$_parent:$1" in
+          true:?????????[tT]*) ;;
+          *) _unsafe=true ;;
+        esac
+        ;;
+    esac
+    if [ "$_unsafe" = true ]; then
+      die "$_dir can be changed by users other than root, so installing into $DIR_GIVEN as root isn't safe" \
+        "Install into a directory only root can change, such as /usr/local/bin, or run the installer as a normal user"
+    fi
+
+    [ "$_dir" != / ] || return 0
+    _dir="${_dir%/*}"
+    [ -n "$_dir" ] || _dir=/
+    _parent=true
+  done
+}
+
+# install_binary: install BINARY into the install directory, creating it if
+# needed. It's installed under a temporary name, then renamed over any older
+# copy, so an upgrade never leaves a half-written binary and works even while
+# the old one is running.
+install_binary() {
+  # mv would move the binary inside a directory rather than replace it
+  [ ! -d "$OPT_DIR/$PRODUCT" ] ||
+    die "$OPT_DIR/$PRODUCT is a directory, so $PRODUCT can't be installed there" "Move or remove it, then try again"
+
+  check_root_owned
+  check_writable
+  mkdir -p "$OPT_DIR" || die "Couldn't create $OPT_DIR" "Check the path, then try again"
+  STAGED="$OPT_DIR/.$PRODUCT.install.$$"
+  if ! install -m 755 "$BINARY" "$STAGED" || ! mv -f "$STAGED" "$OPT_DIR/$PRODUCT"; then
+    die "Couldn't install $PRODUCT into $OPT_DIR" "Run with --debug for details"
+  fi
+  STAGED=""
+}
+
+# check_version: before anything is installed, the verified binary must report
+# the version being installed. It runs from the private temporary directory,
+# by its full path, so nobody else can swap it and another copy on PATH can't
+# answer. A failed check leaves any installed copy alone. Every purpleclay
+# tool answers to --version or -V.
+check_version() {
+  _want="${TAG#v}"
+  # Tells a temporary directory mounted noexec apart from a broken binary
+  printf '#!/bin/sh\n' >"$WORK/probe" && chmod 755 "$WORK/probe" "$BINARY"
+  "$WORK/probe" 2>/dev/null ||
+    die "Programs can't be run from $WORK, so the version of $PRODUCT can't be checked" \
+      "Set TMPDIR to a directory that allows running programs, then try again"
+
+  _out=$("$BINARY" --version </dev/null 2>&1) ||
+    _out=$("$BINARY" -V </dev/null 2>&1) || _out=""
+  _first=$(printf '%s\n' "$_out" | awk 'NR == 1')
+  debug "$PRODUCT reported: ${_first:-nothing}"
+  # A whole word of the output must be the version, with or without a v, so
+  # 0.12.2 isn't mistaken for 0.12.20 or 10.12.2
+  if ! printf '%s\n' "$_out" | awk -v want="$_want" '
+    {
+      n = split($0, words, "[^0-9A-Za-z.+-]+")
+      for (i = 1; i <= n; i++) {
+        word = words[i]
+        sub(/^v/, "", word)
+        if (word == want) found = 1
+      }
+    }
+    END { exit !found }'; then
+    die "$ASSET reports ${_first:-nothing} rather than version $_want" \
+      "Report this at $GITHUB_URL/$GITHUB_OWNER/$PRODUCT/issues"
+  fi
+}
+
+warn_if_not_on_path() {
+  # PATH may name the directory with a trailing slash, or as given rather than
+  # resolved
+  case ":$PATH:" in
+    *":$OPT_DIR:"* | *":$OPT_DIR/:"* | *":$DIR_GIVEN:"* | *":$DIR_GIVEN/:"*) ;;
+    *)
+      warn "$OPT_DIR isn't on your PATH, so run $PRODUCT with its full path" \
+        "Add it to PATH in your shell's profile, then open a new terminal, to run $PRODUCT by name"
+      ;;
+  esac
+}
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -744,7 +950,16 @@ main() {
   verify_checksum
   done_step Verified "the checksum of $ASSET"
 
-  warn "Installing isn't supported yet, so nothing was installed"
+  begin Checking "the version $PRODUCT reports"
+  extract_binary
+  check_version
+  done_step Checked "$PRODUCT reports version ${TAG#v}"
+
+  begin Installing "$PRODUCT $TAG into $OPT_DIR"
+  install_binary
+  done_step Installed "$PRODUCT $TAG into $OPT_DIR"
+
+  warn_if_not_on_path
 }
 
 main "$@"
