@@ -1,0 +1,219 @@
+name: release
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions: {}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  # Releases come from main, which ci has already linted and tested, so
+  # nothing is run again here. Instead, the tag must be a signed vX.Y.Z on a
+  # commit of main whose ci run passed.
+  verify:
+    name: verify
+    runs-on: ubuntu-26.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      actions: read # find the tagged commit's ci run
+    steps:
+      - name: harden_runner
+        uses: step-security/harden-runner@ccd8616d44fd3846e67624a50d5aad6d37bf2d25 # v2.22.1
+        with:
+          egress-policy: block
+          allowed-endpoints: >
+            api.github.com:443
+            github.com:443
+
+      - name: checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: validate_tag
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          # The tag trigger is a glob, so "v*.*.*" also matches tags such as
+          # "vfoo.bar.baz". Stop before anything is deployed or published.
+          if ! [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::tag '$TAG' is not a valid release tag; expected vX.Y.Z"
+            exit 1
+          fi
+
+      - name: verify_tag_signature
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          # Only purpleclay may sign releases, so their keys alone go into an
+          # isolated keyring: a good signature can only be theirs.
+          export GNUPGHOME
+          GNUPGHOME="$(mktemp -d)"
+          gh api users/purpleclay/gpg_keys --jq '.[].raw_key' | gpg --batch --import
+          if ! git verify-tag "$TAG"; then
+            echo "::error::tag '$TAG' is not signed by an authorized signer (purpleclay)"
+            exit 1
+          fi
+
+      - name: verify_on_main
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+            echo "::error::tag '$TAG' points at $GITHUB_SHA, which isn't on main"
+            exit 1
+          fi
+
+      - name: verify_ci_passed
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          conclusion=$(gh run list --commit "$GITHUB_SHA" --workflow ci.yml --branch main --event push \
+            --json conclusion --jq '.[0].conclusion // ""')
+          if [ "$conclusion" != success ]; then
+            echo "::error::ci on main hasn't passed for $GITHUB_SHA (conclusion: ${conclusion:-none yet})"
+            exit 1
+          fi
+
+  deploy:
+    name: deploy
+    needs: [verify]
+    runs-on: ubuntu-26.04
+    timeout-minutes: 10
+    environment: release
+    permissions:
+      contents: read
+    steps:
+      - name: harden_runner
+        uses: step-security/harden-runner@ccd8616d44fd3846e67624a50d5aad6d37bf2d25 # v2.22.1
+        with:
+          egress-policy: block
+          allowed-endpoints: >
+            api.cloudflare.com:443
+            api.github.com:443
+            cache.nixos.org:443
+            get.purpleclay.io:443
+            github.com:443
+            releases.nixos.org:443
+
+      - name: checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: install_nix
+        uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31.11.1
+        with:
+          github_access_token: ${{ secrets.GITHUB_TOKEN }}
+
+      # The repository's install.sh says it's version "dev". The deployed copy
+      # says the release's version, so nothing needs bumping before a tag.
+      - name: stamp_version
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          sed "s/^INSTALLER_VERSION=.*/INSTALLER_VERSION=\"${TAG#v}\"/" install.sh >public/install.sh
+          # Exactly one line may change, so a renamed variable can't go out unstamped
+          changed=$(diff install.sh public/install.sh | grep -c '^>' || true)
+          if [ "$changed" != 1 ] || ! grep -qx "INSTALLER_VERSION=\"${TAG#v}\"" public/install.sh; then
+            echo "::error::couldn't set INSTALLER_VERSION in install.sh to ${TAG#v}"
+            exit 1
+          fi
+
+      - name: wrangler_deploy
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+          WRANGLER_SEND_METRICS: "false"
+        run: nix develop .#ci -c wrangler deploy
+
+      # Cloudflare can take a few seconds to serve a new deploy everywhere, so
+      # the checks are retried for about a minute before failing
+      - name: smoke
+        run: |
+          check() {
+            test "$(curl -s -o /dev/null -w '%{http_code} %{redirect_url}' https://get.purpleclay.io/)" \
+              = "302 https://get.purpleclay.io/install.sh" ||
+              { echo "/ doesn't redirect to /install.sh"; return 1; }
+            curl -fsSI https://get.purpleclay.io/install.sh | grep -qi '^content-type: text/plain' ||
+              { echo "/install.sh isn't served as text/plain"; return 1; }
+            curl -fsSL https://get.purpleclay.io | cmp -s - public/install.sh ||
+              { echo "The served script isn't the install.sh just deployed"; return 1; }
+          }
+          for attempt in 1 2 3 4 5 6; do
+            if check; then
+              exit 0
+            fi
+            if [ "$attempt" -lt 6 ]; then
+              echo "Attempt $attempt failed, retrying in 10 seconds"
+              sleep 10
+            fi
+          done
+          echo "::error::get.purpleclay.io still doesn't serve the install.sh just deployed"
+          exit 1
+
+  # Published only once the script is live, so a release never describes a
+  # version that isn't being served
+  publish:
+    name: publish
+    needs: [deploy]
+    runs-on: ubuntu-26.04
+    timeout-minutes: 5
+    permissions:
+      contents: write # create the GitHub release
+    steps:
+      - name: harden_runner
+        uses: step-security/harden-runner@ccd8616d44fd3846e67624a50d5aad6d37bf2d25 # v2.22.1
+        with:
+          egress-policy: block
+          allowed-endpoints: >
+            api.github.com:443
+            cafe.github.com:443
+            github.com:443
+            release-assets.githubusercontent.com:443
+            tmaproduction.blob.core.windows.net:443
+            tuf-repo-cdn.sigstore.dev:443
+            tuf-repo.github.com:443
+
+      - name: checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: release_note
+        id: notes
+        uses: purpleclay/release-note-action@173903da3997acebdb2c04f3de707c7c4c1a283e # v0.3.1
+
+      - name: publish_release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+          NOTES_FILE: ${{ steps.notes.outputs.release-note-path }}
+        run: |
+          set -euo pipefail
+          # gh exits 1 both when the release is missing and when the check
+          # itself fails, so only the exact "release not found" message means
+          # it's missing. A release that already exists is left alone, as
+          # GitHub releases can be made immutable.
+          if view_output=$(gh release view "$TAG" 2>&1 >/dev/null); then
+            echo "release for '$TAG' already exists; nothing to publish"
+          elif [ "$view_output" = "release not found" ]; then
+            gh release create "$TAG" --title "$TAG" --notes-file "$NOTES_FILE" --verify-tag
+          else
+            echo "::error::could not confirm whether a release for '$TAG' already exists: $view_output"
+            exit 1
+          fi
