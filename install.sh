@@ -10,7 +10,8 @@
 # Nothing runs until `main "$@"` on the final line. If this script is cut off
 # while being piped into a shell, the shell only defines functions and exits.
 
-INSTALLER_VERSION="0.1.0"
+# Replaced with the release's version, such as 1.2.3, when the script is deployed
+INSTALLER_VERSION="dev"
 
 # ---------------------------------------------------------------------------
 # Helpers

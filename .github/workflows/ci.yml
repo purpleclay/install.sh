@@ -16,7 +16,7 @@ concurrency:
 jobs:
   lint:
     name: lint
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 5
     permissions:
       contents: read
@@ -49,7 +49,7 @@ jobs:
 
   test:
     name: test (${{ matrix.shell }})
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 5
     strategy:
       fail-fast: false
@@ -90,68 +90,3 @@ jobs:
         if: matrix.shell == 'dash'
         run: nix develop .#ci -c bats test/live
 
-  deploy:
-    name: deploy
-    needs: [lint, test]
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    environment: release
-    permissions:
-      contents: read
-    steps:
-      - name: harden_runner
-        uses: step-security/harden-runner@ccd8616d44fd3846e67624a50d5aad6d37bf2d25 # v2.22.1
-        with:
-          egress-policy: block
-          allowed-endpoints: >
-            api.cloudflare.com:443
-            api.github.com:443
-            cache.nixos.org:443
-            get.purpleclay.io:443
-            github.com:443
-            releases.nixos.org:443
-
-      - name: checkout
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-
-      - name: install_nix
-        uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31.11.1
-        with:
-          github_access_token: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: wrangler_deploy
-        env:
-          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
-          WRANGLER_SEND_METRICS: "false"
-        run: |
-          cp install.sh public/
-          nix develop .#ci -c wrangler deploy
-
-      # Cloudflare can take a few seconds to serve a new deploy everywhere, so
-      # the checks are retried for about a minute before failing
-      - name: smoke
-        run: |
-          check() {
-            test "$(curl -s -o /dev/null -w '%{http_code} %{redirect_url}' https://get.purpleclay.io/)" \
-              = "302 https://get.purpleclay.io/install.sh" ||
-              { echo "/ doesn't redirect to /install.sh"; return 1; }
-            curl -fsSI https://get.purpleclay.io/install.sh | grep -qi '^content-type: text/plain' ||
-              { echo "/install.sh isn't served as text/plain"; return 1; }
-            curl -fsSL https://get.purpleclay.io | cmp -s - install.sh ||
-              { echo "The served script isn't this commit's install.sh"; return 1; }
-          }
-          for attempt in 1 2 3 4 5 6; do
-            if check; then
-              exit 0
-            fi
-            if [ "$attempt" -lt 6 ]; then
-              echo "Attempt $attempt failed, retrying in 10 seconds"
-              sleep 10
-            fi
-          done
-          echo "::error::get.purpleclay.io still doesn't serve this commit's install.sh"
-          exit 1

@@ -15,6 +15,7 @@
 !public/_headers
 !public/_redirects
 !README.md
+!RELEASE.md
 !scripts/*.awk
 !test/*.bats
 !test/live/*.bats
