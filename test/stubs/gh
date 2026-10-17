@@ -1,0 +1,28 @@
+#!/bin/sh
+# Stub gh: answers gh auth status and gh attestation verify. Logged in unless
+# STUB_GH_AUTH=1. Verification succeeds unless STUB_GH_VERIFY is fail, which
+# fails as gh does for an archive with no attestation, or fail-plain, which
+# fails as an old gh without attestation support does. Each call is appended
+# to STUB_LOG.
+echo "gh $*" >>"$STUB_LOG"
+case "$1 $2" in
+  "auth status")
+    [ "${STUB_GH_AUTH:-0}" = 0 ] || echo "You are not logged into any GitHub hosts." >&2
+    exit "${STUB_GH_AUTH:-0}"
+    ;;
+  "attestation verify")
+    case "${STUB_GH_VERIFY:-ok}" in
+      fail)
+        echo "Loaded digest sha256:0123 for file://$3"
+        echo "Error: HTTP 404: Not Found (https://api.github.com/repos/purpleclay/nsv/attestations/sha256:0123)" >&2
+        exit 1
+        ;;
+      fail-plain)
+        echo 'unknown command "attestation" for "gh"' >&2
+        exit 1
+        ;;
+    esac
+    echo "Loaded digest sha256:0123 for file://$3"
+    echo "✓ Verification succeeded!"
+    ;;
+esac

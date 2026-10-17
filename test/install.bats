@@ -14,7 +14,8 @@ setup() {
   # being tested
   unset NO_COLOR PURPLECLAY_DEBUG PURPLECLAY_VERSION COLORTERM LC_ALL LC_CTYPE \
     HTTPS_PROXY https_proxy ALL_PROXY all_proxy NO_PROXY no_proxy \
-    CURL_CA_BUNDLE SSL_CERT_FILE SSL_CERT_DIR PURPLECLAY_DIR
+    CURL_CA_BUNDLE SSL_CERT_FILE SSL_CERT_DIR PURPLECLAY_DIR \
+    PURPLECLAY_REQUIRE_ATTESTATION
   export LANG=C TERM=xterm-256color
   bats_load_library bats-support
   bats_load_library bats-assert
@@ -175,6 +176,7 @@ on_tty() {
   assert_output --partial "PURPLECLAY_VERSION"
   assert_output --partial "PURPLECLAY_DIR"
   assert_output --partial "[default: ~/.local/bin, or /usr/local/bin as root]"
+  assert_output --partial "PURPLECLAY_REQUIRE_ATTESTATION"
 }
 
 @test "a missing product fails with a hint" {
@@ -776,6 +778,72 @@ EOF
   assert_line --regexp '^ +\| GET /releases/download/v0\.12\.2/checksums\.txt returned 200 from release-assets\.githubusercontent\.com$'
   assert_line --regexp '^ +\| Selected +nsv_0\.12\.2_linux_x86_64\.tar\.gz$'
   refute_output --partial "s3cret"
+}
+
+# ---------------------------------------------------------------------------
+# Build provenance
+# ---------------------------------------------------------------------------
+
+@test "build provenance is verified with gh, pinned to the release workflows" {
+  run "$INSTALLER" nsv
+  assert_success
+  assert_line "    Verified the build provenance of nsv_0.12.2_linux_x86_64.tar.gz"
+  # shellcheck disable=SC2016 # the pattern gh is given, not a shell expansion
+  assert grep -qF -- '/nsv_0.12.2_linux_x86_64.tar.gz --repo purpleclay/nsv --cert-identity-regex ^https://github\.com/purpleclay/release-workflows/\.github/workflows/release-(go|rust)\.yml@' "$STUB_LOG"
+}
+
+@test "an archive without a valid attestation fails before anything runs or is installed" {
+  STUB_GH_VERIFY=fail run "$INSTALLER" nsv
+  assert_failure
+  assert_line "       Error The build provenance of nsv_0.12.2_linux_x86_64.tar.gz couldn't be verified, so nothing was installed"
+  assert_line --regexp '^             gh reported: Error: HTTP 404: Not Found '
+  assert_line "             Run with --debug to see everything gh reported"
+  refute_output --partial "wasn't built by"
+  refute_output --partial "Checked nsv"
+  [ ! -e "$PURPLECLAY_DIR/nsv" ]
+}
+
+@test "a verification failure shows the cause gh reported, whatever its form" {
+  # gh doesn't prefix every failure with "Error:"
+  STUB_GH_VERIFY=fail-plain run "$INSTALLER" nsv
+  assert_failure
+  assert_output --partial 'gh reported: unknown command "attestation" for "gh"'
+}
+
+@test "without gh, or when gh isn't logged in, the check is skipped and says how to enable it" {
+  rm "$BIN/gh"
+  run "$INSTALLER" nsv
+  assert_success
+  assert_output --partial "$(printf '%s\n%s' \
+    "     Skipped the build provenance check, as gh isn't installed" \
+    "             Install the GitHub CLI (https://cli.github.com) and run gh auth login to check where builds came from")"
+
+  ln -s "$BATS_TEST_DIRNAME/stubs/gh" "$BIN/gh"
+  STUB_GH_AUTH=1 run "$INSTALLER" nsv
+  assert_success
+  assert_output --partial "$(printf '%s\n%s' \
+    "     Skipped the build provenance check, as gh isn't logged in" \
+    "             Run gh auth login, or set GH_TOKEN, to check where builds came from")"
+  refute grep -q "attestation verify" "$STUB_LOG"
+}
+
+@test "--require-attestation and PURPLECLAY_REQUIRE_ATTESTATION fail rather than skip" {
+  STUB_GH_AUTH=1 run "$INSTALLER" --require-attestation nsv
+  assert_failure
+  assert_output --partial "Error The build provenance of nsv_0.12.2_linux_x86_64.tar.gz can't be checked, as gh isn't logged in, and --require-attestation is set"
+  assert_output --partial "Run gh auth login, or set GH_TOKEN"
+
+  rm "$BIN/gh"
+  PURPLECLAY_REQUIRE_ATTESTATION=true run "$INSTALLER" nsv
+  assert_failure
+  assert_output --partial "can't be checked, as gh isn't installed, and --require-attestation is set"
+  [ ! -e "$PURPLECLAY_DIR/nsv" ]
+}
+
+@test "debug output shows what gh reported" {
+  run "$INSTALLER" --debug nsv
+  assert_success
+  assert_line --regexp '^ +. ✓ Verification succeeded!$'
 }
 
 # ---------------------------------------------------------------------------

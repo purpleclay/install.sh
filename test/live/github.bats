@@ -10,31 +10,36 @@ setup() {
   bats_load_library bats-support
   bats_load_library bats-assert
   cd "$BATS_TEST_DIRNAME/../.." || exit 1
+  # Build provenance is only checked with a logged-in gh, which CI gets from
+  # GH_TOKEN. Without it every check would be skipped, so fail instead.
+  gh auth status >/dev/null 2>&1 || fail "the live tests need gh logged in, or GH_TOKEN set"
 }
 
-# nsv doesn't answer to --version or -V yet, so its version check fails and
-# it isn't installed. Once nsv is fixed, these assert success like release-note.
-nsv_version_check_fails() {
+# nsv is still released with GoReleaser, so it has no build provenance from
+# release-workflows and isn't installed. Once nsv moves to release-workflows
+# (issue 9), these assert success like release-note.
+nsv_has_no_provenance() {
   assert_failure
-  assert_output --regexp "nsv_[^ ]+ reports nothing rather than version"
+  assert_output --regexp "The build provenance of nsv_[^ ]+ couldn't be verified"
 }
 
 @test "verifies the latest release of a Go and a Rust product" {
   run sh install.sh nsv
-  nsv_version_check_fails
+  nsv_has_no_provenance
   assert_output --regexp 'Resolved the latest release of nsv as v[0-9]+\.[0-9]+\.[0-9]+'
   assert_output --regexp 'Verified the checksum of nsv_[0-9.]+_(linux|darwin)_(x86_64|arm64)\.tar\.gz'
 
   run sh install.sh release-note
   assert_success
   assert_output --regexp 'Resolved the latest release of release-note as [0-9]+\.[0-9]+\.[0-9]+'
+  assert_output --regexp 'Verified the build provenance of release-note-[0-9.]+-'
   assert_output --regexp 'Verified the checksum of release-note-[0-9.]+-(x86_64|aarch64)-[a-z-]+\.tar\.gz'
 }
 
 @test "resolves a version with or without a v, for Go and Rust tags" {
   for version in 0.12.2 v0.12.2; do
     run sh install.sh --version "$version" nsv
-    nsv_version_check_fails
+    nsv_has_no_provenance
     assert_output --partial "Resolved release v0.12.2 of nsv"
   done
   for version in 0.12.0 v0.12.0; do
@@ -64,7 +69,7 @@ nsv_version_check_fails() {
 with_only_wget() {
   bin="$BATS_TEST_TMPDIR/bin"
   mkdir -p "$bin"
-  for tool in awk cat chmod grep gzip id install ls mkdir mktemp mv ps readlink rm sed \
+  for tool in awk cat chmod gh grep gzip id install ls mkdir mktemp mv ps readlink rm sed \
     sha256sum shasum openssl sysctl tar tr uname; do
     ! tool_path=$(command -v "$tool") || ln -sf "$tool_path" "$bin/$tool"
   done
@@ -78,7 +83,7 @@ with_only_wget() {
     skip "GNU wget isn't installed"
 
   run with_only_wget "$gnu_wget" nsv
-  nsv_version_check_fails
+  nsv_has_no_provenance
   assert_output --regexp 'Resolved the latest release of nsv as v[0-9]+\.[0-9]+\.[0-9]+'
   assert_output --partial "Verified the checksum of nsv_"
 

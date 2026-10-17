@@ -93,6 +93,7 @@
               [
                 bats
                 dash
+                gh
                 shfmt
                 shellcheck
                 wrangler

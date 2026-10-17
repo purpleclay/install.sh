@@ -68,6 +68,9 @@ jobs:
             github.com:443
             release-assets.githubusercontent.com:443
             releases.nixos.org:443
+            tmaproduction.blob.core.windows.net:443
+            tuf-repo-cdn.sigstore.dev:443
+            tuf-repo.github.com:443
 
       - name: checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -88,5 +91,7 @@ jobs:
       # GitHub, not the shell, so it only needs to run once.
       - name: bats_live
         if: matrix.shell == 'dash'
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: nix develop .#ci -c bats test/live
 
