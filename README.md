@@ -1,6 +1,6 @@
 # install.sh
 
-One script to install any purpleclay tool, verified against its checksum.
+One script to install any purpleclay tool, verified against its checksum and SLSA build provenance.
 
 ## Install a product
 
@@ -8,7 +8,7 @@ One script to install any purpleclay tool, verified against its checksum.
 curl -fsSL https://get.purpleclay.io | sh -s -- release-note
 ```
 
-Each release is checked against its `checksums.txt`, and the binary must report the version being installed, before anything is installed. It goes into `~/.local/bin`, or `/usr/local/bin` when run as root.
+Each release is checked against its `checksums.txt`, its build provenance is verified with the [GitHub CLI](https://cli.github.com) when `gh` is logged in, and the binary must report the version being installed, before anything is installed. Use `--require-attestation` to fail rather than skip the provenance check when `gh` isn't available. It goes into `~/.local/bin`, or `/usr/local/bin` when run as root.
 
 ```sh
 # A specific version, with or without a v

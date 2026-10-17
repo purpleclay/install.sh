@@ -136,6 +136,13 @@ warn() {
   hints "$@"
 }
 
+# skip MESSAGE [HINT...]: a step that didn't run, followed by how to enable it.
+skip() {
+  printf '%s %s\n' "$(label 36 Skipped)" "$1" >&2
+  shift
+  hints "$@"
+}
+
 # die MESSAGE [HINT...]: a failed step, followed by hints on what to do next.
 die() {
   printf '%s %s\n' "$(label 31 Error)" "$1" >&2
@@ -179,7 +186,7 @@ debug_context() {
 
   # Settings the installer documents are always listed. Settings that
   # change how requests are made are listed only when set, to keep this short.
-  for _var in PURPLECLAY_DEBUG PURPLECLAY_VERSION PURPLECLAY_DIR NO_COLOR COLORTERM TERM LANG LC_ALL LC_CTYPE; do
+  for _var in PURPLECLAY_DEBUG PURPLECLAY_VERSION PURPLECLAY_DIR PURPLECLAY_REQUIRE_ATTESTATION NO_COLOR COLORTERM TERM LANG LC_ALL LC_CTYPE; do
     eval "_value=\${$_var-(not set)}"
     debug_pair "$_var" "$_value"
   done
@@ -290,6 +297,7 @@ print_help() {
   printf '%s\n' "$(bold 'FLAGS')"
   help_flag "-v, --version <VERSION>" "Install a specific version, e.g. 1.2.3 or v1.2.3 [default: latest]" "PURPLECLAY_VERSION"
   help_flag "-d, --dir <DIR>" "Directory to install into [default: ~/.local/bin, or /usr/local/bin as root]" "PURPLECLAY_DIR"
+  help_flag "    --require-attestation" "Fail rather than skip the build provenance check when gh isn't available" "PURPLECLAY_REQUIRE_ATTESTATION"
   help_flag "    --debug" "Print debug output" "PURPLECLAY_DEBUG"
   help_flag "    --no-color" "Disable colour" "NO_COLOR"
   help_flag "-h, --help" "Print this help"
@@ -302,6 +310,7 @@ print_help() {
 init_config() {
   OPT_VERSION="${PURPLECLAY_VERSION:-}"
   OPT_DIR="${PURPLECLAY_DIR:-}"
+  OPT_REQUIRE_ATTESTATION="${PURPLECLAY_REQUIRE_ATTESTATION:-false}"
   OPT_DEBUG="${PURPLECLAY_DEBUG:-false}"
   OPT_NO_COLOR=false
   OPT_HELP=false
@@ -322,6 +331,7 @@ parse_args() {
         OPT_DIR="$2"
         shift
         ;;
+      --require-attestation) OPT_REQUIRE_ATTESTATION=true ;;
       --debug) OPT_DEBUG=true ;;
       --no-color) OPT_NO_COLOR=true ;;
       -*) die "Unknown flag '$1'" "Run with --help to see the available flags" ;;
@@ -721,6 +731,44 @@ verify_checksum() {
   fi
 }
 
+# Only the release workflows in purpleclay/release-workflows may sign a
+# product's build provenance, not any other workflow there
+SIGNER_PATTERN='^https://github\.com/purpleclay/release-workflows/\.github/workflows/release-(go|rust)\.yml@'
+
+# verify_provenance: sets PROVENANCE to verified, or to skipped with SKIP_WHY
+# and SKIP_HOW, when gh can't check it. Runs before the binary is ever run.
+verify_provenance() {
+  PROVENANCE=skipped
+  if ! have gh; then
+    SKIP_WHY="gh isn't installed"
+    SKIP_HOW="Install the GitHub CLI (https://cli.github.com) and run gh auth login to check where builds came from"
+  elif ! gh auth status >/dev/null 2>&1; then
+    SKIP_WHY="gh isn't logged in"
+    SKIP_HOW="Run gh auth login, or set GH_TOKEN, to check where builds came from"
+  else
+    _rc=0
+    _out=$(gh attestation verify "$ARCHIVE" --repo "$GITHUB_OWNER/$PRODUCT" \
+      --cert-identity-regex "$SIGNER_PATTERN" 2>&1) || _rc=$?
+    printf '%s\n' "$_out" | while IFS= read -r _line; do
+      [ -z "$_line" ] || debug "$_line"
+    done
+    # A failure doesn't say why: the archive may not be attested, or gh may
+    # not have reached GitHub. So the cause gh gave is shown, not guessed:
+    # its last "Error:" line, or failing that, its last line.
+    if [ "$_rc" -ne 0 ]; then
+      _cause=$(printf '%s\n' "$_out" | awk '/^Error:/ { e = $0 } NF { l = $0 } END { print (e != "" ? e : l) }')
+      die "The build provenance of $ASSET couldn't be verified, so nothing was installed" \
+        ${_cause:+"gh reported: $_cause"} \
+        "Run with --debug to see everything gh reported"
+    fi
+    PROVENANCE=verified
+    return 0
+  fi
+
+  ! is_true "$OPT_REQUIRE_ATTESTATION" ||
+    die "The build provenance of $ASSET can't be checked, as $SKIP_WHY, and --require-attestation is set" "$SKIP_HOW"
+}
+
 # ---------------------------------------------------------------------------
 # Installing
 # ---------------------------------------------------------------------------
@@ -950,6 +998,14 @@ main() {
   begin Verifying "the checksum of $ASSET"
   verify_checksum
   done_step Verified "the checksum of $ASSET"
+
+  begin Verifying "the build provenance of $ASSET"
+  verify_provenance
+  if [ "$PROVENANCE" = verified ]; then
+    done_step Verified "the build provenance of $ASSET"
+  else
+    skip "the build provenance check, as $SKIP_WHY" "$SKIP_HOW"
+  fi
 
   begin Checking "the version $PRODUCT reports"
   extract_binary
