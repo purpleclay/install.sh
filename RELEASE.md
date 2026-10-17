@@ -25,10 +25,11 @@ Tags are `vX.Y.Z`, and the version tracks what people running the installer see:
    git push origin vX.Y.Z
    ```
 
-3. The `release` workflow then runs three jobs:
+3. The `release` workflow then runs four jobs:
    - **verify** checks the tag is a `vX.Y.Z` signed by `purpleclay`, on a commit of `main` whose `ci` run passed. If `ci` hasn't finished yet, wait for it, then re-run the workflow.
-   - **deploy** waits for your approval in the `release` environment, sets the script's version from the tag, deploys it to Cloudflare, and checks `get.purpleclay.io` serves it.
-   - **publish** generates the release note and creates the GitHub release.
+   - **build** sets the script's version from the tag, and attests it with build provenance.
+   - **deploy** waits for your approval in the `release` environment, deploys that script to Cloudflare, and checks `get.purpleclay.io` serves it.
+   - **publish** generates the release note, and creates the GitHub release with the same `install.sh` attached.
 
 4. Check the live script reports the new version:
 
