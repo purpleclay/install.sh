@@ -87,9 +87,80 @@ jobs:
             exit 1
           fi
 
+  # Builds the release's install.sh once and attests it, so the script that's
+  # deployed, the release asset and the attestation are the same bytes
+  build:
+    name: build
+    needs: [verify]
+    runs-on: ubuntu-26.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      id-token: write # sigstore keyless signing for build provenance
+      attestations: write # publish the provenance attestation to the repo
+    steps:
+      - name: harden_runner
+        uses: step-security/harden-runner@ccd8616d44fd3846e67624a50d5aad6d37bf2d25 # v2.22.1
+        with:
+          egress-policy: block
+          allowed-endpoints: >
+            api.github.com:443
+            fulcio.sigstore.dev:443
+            github.com:443
+            rekor.sigstore.dev:443
+            tmaproduction.blob.core.windows.net:443
+            tuf-repo-cdn.sigstore.dev:443
+            tuf-repo.github.com:443
+
+      - name: checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # The repository's install.sh says it's version "dev". The released copy
+      # says the release's version, so nothing needs bumping before a tag.
+      - name: stamp_version
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          mkdir dist
+          sed "s/^INSTALLER_VERSION=.*/INSTALLER_VERSION=\"${TAG#v}\"/" install.sh >dist/install.sh
+          # Exactly one line may change, so a renamed variable can't go out unstamped
+          changed=$(diff install.sh dist/install.sh | grep -c '^>' || true)
+          if [ "$changed" != 1 ] || ! grep -qx "INSTALLER_VERSION=\"${TAG#v}\"" dist/install.sh; then
+            echo "::error::couldn't set INSTALLER_VERSION in install.sh to ${TAG#v}"
+            exit 1
+          fi
+
+      - name: attest_build_provenance
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: dist/install.sh
+
+      # Runs the verify command the README documents, before anything is
+      # deployed, as an immutable release can't be fixed afterwards
+      - name: verify_attestation
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh attestation verify dist/install.sh \
+            --repo "$GITHUB_REPOSITORY" \
+            --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/release.yml" \
+            --source-ref "$GITHUB_REF"
+
+      - name: upload_script
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: install-sh
+          path: dist/install.sh
+          if-no-files-found: error
+          # Only this run needs it; the release keeps the lasting copy
+          retention-days: 1
+
   deploy:
     name: deploy
-    needs: [verify]
+    needs: [build]
     runs-on: ubuntu-26.04
     timeout-minutes: 10
     environment: release
@@ -118,20 +189,11 @@ jobs:
         with:
           github_access_token: ${{ secrets.GITHUB_TOKEN }}
 
-      # The repository's install.sh says it's version "dev". The deployed copy
-      # says the release's version, so nothing needs bumping before a tag.
-      - name: stamp_version
-        env:
-          TAG: ${{ github.ref_name }}
-        run: |
-          set -euo pipefail
-          sed "s/^INSTALLER_VERSION=.*/INSTALLER_VERSION=\"${TAG#v}\"/" install.sh >public/install.sh
-          # Exactly one line may change, so a renamed variable can't go out unstamped
-          changed=$(diff install.sh public/install.sh | grep -c '^>' || true)
-          if [ "$changed" != 1 ] || ! grep -qx "INSTALLER_VERSION=\"${TAG#v}\"" public/install.sh; then
-            echo "::error::couldn't set INSTALLER_VERSION in install.sh to ${TAG#v}"
-            exit 1
-          fi
+      - name: download_script
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: install-sh
+          path: public
 
       - name: wrangler_deploy
         env:
@@ -173,7 +235,7 @@ jobs:
     runs-on: ubuntu-26.04
     timeout-minutes: 5
     permissions:
-      contents: write # create the GitHub release
+      contents: write # create the GitHub release and upload install.sh
     steps:
       - name: harden_runner
         uses: step-security/harden-runner@ccd8616d44fd3846e67624a50d5aad6d37bf2d25 # v2.22.1
@@ -187,12 +249,19 @@ jobs:
             tmaproduction.blob.core.windows.net:443
             tuf-repo-cdn.sigstore.dev:443
             tuf-repo.github.com:443
+            uploads.github.com:443
 
       - name: checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
           fetch-depth: 0
+
+      - name: download_script
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: install-sh
+          path: dist
 
       - name: release_note
         id: notes
@@ -205,15 +274,39 @@ jobs:
           NOTES_FILE: ${{ steps.notes.outputs.release-note-path }}
         run: |
           set -euo pipefail
+          # Releases are immutable once published, so install.sh is attached
+          # as the release is created. gh does that by creating a draft,
+          # uploading, then publishing, so a failed run can leave a draft.
+          create() {
+            gh release create "$TAG" dist/install.sh --title "$TAG" --notes-file "$NOTES_FILE" --verify-tag
+          }
+
           # gh exits 1 both when the release is missing and when the check
           # itself fails, so only the exact "release not found" message means
-          # it's missing. A release that already exists is left alone, as
-          # GitHub releases can be made immutable.
-          if view_output=$(gh release view "$TAG" 2>&1 >/dev/null); then
-            echo "release for '$TAG' already exists; nothing to publish"
-          elif [ "$view_output" = "release not found" ]; then
-            gh release create "$TAG" --title "$TAG" --notes-file "$NOTES_FILE" --verify-tag
-          else
-            echo "::error::could not confirm whether a release for '$TAG' already exists: $view_output"
+          # it's missing
+          if ! release=$(gh release view "$TAG" --json isDraft,assets 2>&1); then
+            if [ "$release" != "release not found" ]; then
+              echo "::error::could not check for a release for '$TAG': $release"
+              exit 1
+            fi
+            create
+            exit 0
+          fi
+
+          # A draft was never published, so it can still be replaced
+          if [ "$(jq -r .isDraft <<<"$release")" = true ]; then
+            echo "replacing the draft release for '$TAG' left by an earlier run"
+            gh release delete "$TAG" --yes
+            create
+            exit 0
+          fi
+
+          # A published release can't be changed, so it only counts as done if
+          # it already carries this exact install.sh
+          want="sha256:$(sha256sum dist/install.sh | cut -d ' ' -f 1)"
+          have=$(jq -r '.assets[] | select(.name == "install.sh") | .digest' <<<"$release")
+          if [ "$have" != "$want" ]; then
+            echo "::error::the published release for '$TAG' doesn't carry this install.sh (found: ${have:-no install.sh}); releases are immutable, so tag a new patch release"
             exit 1
           fi
+          echo "release for '$TAG' already carries this install.sh; nothing to publish"
