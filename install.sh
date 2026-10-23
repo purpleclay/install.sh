@@ -902,7 +902,7 @@ install_binary() {
 # the version being installed. It runs from the private temporary directory,
 # by its full path, so nobody else can swap it and another copy on PATH can't
 # answer. A failed check leaves any installed copy alone. Every purpleclay
-# tool answers to --version or -V.
+# tool answers to version --short, and --version or -V are tried after it.
 check_version() {
   _want="${TAG#v}"
   # Tells a temporary directory mounted noexec apart from a broken binary
@@ -911,7 +911,8 @@ check_version() {
     die "Programs can't be run from $WORK, so the version of $PRODUCT can't be checked" \
       "Set TMPDIR to a directory that allows running programs, then try again"
 
-  _out=$("$BINARY" --version </dev/null 2>&1) ||
+  _out=$("$BINARY" version --short </dev/null 2>&1) ||
+    _out=$("$BINARY" --version </dev/null 2>&1) ||
     _out=$("$BINARY" -V </dev/null 2>&1) || _out=""
   _first=$(printf '%s\n' "$_out" | awk 'NR == 1')
   debug "$PRODUCT reported: ${_first:-nothing}"
