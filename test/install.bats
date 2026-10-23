@@ -94,10 +94,11 @@ release() {
 }
 
 # pack ARCHIVE PRODUCT VERSION: an archive holding a fake PRODUCT binary that
-# prints VERSION when run with --version. Settings change what's packed:
+# prints VERSION when run with --version, and logs the arguments of each run
+# to $BATS_TEST_TMPDIR/runs. Settings change what's packed:
 #   BINARIES       paths of the binaries in the archive [default: PRODUCT]
 #   REPORTS        the version the binaries print [default: VERSION]
-#   VERSION_FLAG   the one flag they answer to [default: --version]
+#   VERSION_FLAG   the only arguments they answer to [default: --version]
 pack() {
   src="$BATS_TEST_TMPDIR/pack"
   rm -rf "$src"
@@ -105,9 +106,9 @@ pack() {
   echo "$2" >"$src/README.md"
   for path in ${BINARIES-$2}; do
     mkdir -p "$src/$(dirname "$path")"
-    # shellcheck disable=SC2016 # $1 belongs to the fake binary
-    printf '#!/bin/sh\n[ "$1" = %s ] || exit 2\necho "%s %s"\n' \
-      "${VERSION_FLAG:---version}" "$2" "${REPORTS:-$3}" >"$src/$path"
+    # shellcheck disable=SC2016 # $* belongs to the fake binary
+    printf '#!/bin/sh\necho "$*" >>"%s"\n[ "$*" = "%s" ] || exit 2\necho "%s %s"\n' \
+      "$BATS_TEST_TMPDIR/runs" "${VERSION_FLAG:---version}" "$2" "${REPORTS:-$3}" >"$src/$path"
     chmod 755 "$src/$path"
   done
   tar -czf "$1" -C "$src" .
@@ -932,11 +933,29 @@ locked() {
   [ ! -e "$PURPLECLAY_DIR/nsv" ]
 }
 
-@test "the version check falls back to -V" {
+@test "the version check asks for version --short first" {
+  VERSION_FLAG="version --short" release nsv v0.12.2 nsv_0.12.2_linux_x86_64.tar.gz
+  run "$INSTALLER" nsv
+  assert_success
+  assert_line "     Checked nsv reports version 0.12.2"
+  run cat "$BATS_TEST_TMPDIR/runs"
+  assert_output "version --short"
+}
+
+@test "the version check falls back to --version, then -V" {
+  run "$INSTALLER" nsv
+  assert_success
+  assert_line "     Checked nsv reports version 0.12.2"
+  run cat "$BATS_TEST_TMPDIR/runs"
+  assert_output "$(printf '%s\n' "version --short" --version)"
+
+  rm "$BATS_TEST_TMPDIR/runs"
   VERSION_FLAG=-V release nsv v0.12.2 nsv_0.12.2_linux_x86_64.tar.gz
   run "$INSTALLER" nsv
   assert_success
   assert_line "     Checked nsv reports version 0.12.2"
+  run cat "$BATS_TEST_TMPDIR/runs"
+  assert_output "$(printf '%s\n' "version --short" --version -V)"
 }
 
 @test "the version check runs the verified binary, not another copy on PATH" {
